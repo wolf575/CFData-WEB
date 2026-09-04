@@ -176,13 +176,13 @@ static const int kBackendPort = 13335;
         return @"";
     }
 
-    unsigned long long fileSize = [handle seekToEndOfFileAndReturnError:&error];
+    unsigned long long fileSize = [handle seekToEndReturningOffset:&error];
     if (error != nil) {
         [handle closeFile];
         return @"";
     }
     unsigned long long offset = fileSize > maxBytes ? fileSize - maxBytes : 0;
-    [handle seekToFileOffset:offset error:&error];
+    [handle seekToOffset:offset error:&error];
     if (error != nil) {
         [handle closeFile];
         return @"";
