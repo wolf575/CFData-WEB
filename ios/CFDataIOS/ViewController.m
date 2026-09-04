@@ -176,18 +176,17 @@ static const int kBackendPort = 13335;
         return @"";
     }
 
-    unsigned long long fileSize = [handle seekToEndReturningOffset:&error];
-    if (error != nil) {
+    NSDictionary *attributes =
+        [[NSFileManager defaultManager] attributesOfItemAtPath:path error:&error];
+    if (attributes == nil) {
         [handle closeFile];
         return @"";
     }
+    unsigned long long fileSize =
+        ((NSNumber *)attributes[NSFileSize]).unsignedLongLongValue;
     unsigned long long offset = fileSize > maxBytes ? fileSize - maxBytes : 0;
-    [handle seekToOffset:offset error:&error];
-    if (error != nil) {
-        [handle closeFile];
-        return @"";
-    }
-    NSData *data = [handle readDataToEndOfFileAndReturnError:&error];
+    [handle seekToFileOffset:offset];
+    NSData *data = [handle readDataToEndOfFile];
     [handle closeFile];
     if (data.length == 0) {
         return @"";
