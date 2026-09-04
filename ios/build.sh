@@ -51,6 +51,8 @@ if [[ ! -d "$APP_PATH" ]]; then
   exit 1
 fi
 
+cp "$ROOT_DIR/ios/Resources/cfdata" "$APP_PATH/cfdata"
+
 if [[ ! -f "$APP_PATH/cfdata" ]]; then
   echo "The bundled backend was not copied to $APP_PATH/cfdata" >&2
   exit 1
