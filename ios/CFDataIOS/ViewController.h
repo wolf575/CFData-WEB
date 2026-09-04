@@ -9,5 +9,6 @@
      UIDocumentPickerDelegate>
 
 - (void)stopBackend;
+- (void)flushLogsToDocuments;
 
 @end

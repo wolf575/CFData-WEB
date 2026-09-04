@@ -141,6 +141,7 @@ func hasNoColorArg() bool {
 }
 
 func main() {
+	runtimeLog("info", "process", "starting")
 	rewriteBoolFlagArgs()
 	if !enableTerminalANSI() || os.Getenv("NO_COLOR") != "" || hasNoColorArg() {
 		disableANSIColors()
@@ -180,7 +181,6 @@ func main() {
 		}
 	}
 	speedTestWorkers = cliCfg.speedTest
-	configureHTTPClients()
 	startupSpeedTestURL := resolveSpeedTestURL(speedTestURL)
 	if webSessionMinutes <= 0 {
 		webSessionMinutes = 720
@@ -196,6 +196,9 @@ func main() {
 		}
 	}
 	if cliCfg.enabled {
+		runtimeLog("info", "cli", "configuring HTTP clients")
+		configureHTTPClients()
+		markHTTPClientConfigured()
 		initLocations()
 		if err := runCLI(cliCfg); err != nil {
 			recordProgramDebugError("cli_run", err.Error())
@@ -204,6 +207,9 @@ func main() {
 		return
 	}
 
+	http.HandleFunc("/healthz", handleHealthCheck)
+	http.HandleFunc("/__cfdata/diagnostics", handleRuntimeDiagnostics)
+	http.HandleFunc("/__cfdata/log", handleRuntimeLog)
 	http.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleLoginPost(w, r)
@@ -240,7 +246,6 @@ func main() {
 		displayHost = strings.TrimSpace(listenHost)
 	}
 	fmt.Printf("CFData-WEB 版本: %s\n", appVersion)
-	go checkAndPrintUpdate("")
 	displayURL := fmt.Sprintf("http://%s:%d", displayHost, listenPort)
 	if webUser != "" && webPassword != "" {
 		fmt.Printf("Web 认证已启用，用户名: %s\n", webUser)
@@ -270,8 +275,10 @@ func main() {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Printf("启动失败: %v\n", err)
+		runtimeLog("error", "server", "listen failed: "+err.Error())
 		return
 	}
+	runtimeLog("info", "server", fmt.Sprintf("listening on %s", listener.Addr().String()))
 	server := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -280,10 +287,24 @@ func main() {
 		serverErrors <- server.Serve(listener)
 	}()
 
-	go initLocations()
-	go warmStartupSpeedTestURL()
+	go func() {
+		runtimeLog("info", "startup", "background initialization starting")
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				runtimeLog("error", "startup", fmt.Sprintf("panic: %v", recovered))
+			}
+		}()
+		configureHTTPClients()
+		markHTTPClientConfigured()
+		runtimeLog("info", "startup", "HTTP clients ready; loading locations and speed settings")
+		go checkAndPrintUpdate("")
+		initLocations()
+		warmStartupSpeedTestURL()
+		runtimeLog("info", "startup", "background initialization finished")
+	}()
 
 	if err := <-serverErrors; err != nil {
 		fmt.Printf("启动失败: %v\n", err)
+		runtimeLog("error", "server", "serve failed: "+err.Error())
 	}
 }

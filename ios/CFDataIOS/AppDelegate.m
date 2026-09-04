@@ -14,7 +14,16 @@
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application {
+    [self.rootViewController flushLogsToDocuments];
     [self.rootViewController stopBackend];
+}
+
+- (void)applicationWillResignActive:(UIApplication *)application {
+    [self.rootViewController flushLogsToDocuments];
+}
+
+- (void)applicationDidEnterBackground:(UIApplication *)application {
+    [self.rootViewController flushLogsToDocuments];
 }
 
 @end
