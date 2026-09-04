@@ -18,6 +18,7 @@ CFData-Web 是一个基于 Go 的 Cloudflare IP 测试与筛选工具，提供�
 - 导出：支持 CSV/TXT、自定义字段、IP 类型筛选、合格结果筛选。
 - 上传：支持将导出结果上传到 GitHub。
 - APK：支持 Android WebView 壳运行内置后端。
+- IPA/TIPA：支持 TrollStore 兼容设备（iOS 14.0-16.6.1、16.7 RC、17.0）通过 iOS WebView 壳运行内置后端。
 
 ## 快速开始
 

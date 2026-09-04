@@ -1,0 +1,39 @@
+name: CFDataIOS
+
+options:
+  bundleIdPrefix: com.cfdata.web
+  deploymentTarget:
+    iOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    CLANG_ENABLE_MODULES: YES
+    CLANG_ENABLE_OBJC_ARC: YES
+    ENABLE_BITCODE: NO
+    IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_VERSION: "5.0"
+
+targets:
+  CFDataIOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: CFDataIOS
+    resources:
+      - path: Resources
+    settings:
+      base:
+        PRODUCT_NAME: CFDataIOS
+        PRODUCT_BUNDLE_IDENTIFIER: com.cfdata.web.ios
+        INFOPLIST_FILE: Support/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Support/CFDataIOS.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        GENERATE_INFOPLIST_FILE: NO
+    scheme:
+      gatherCoverageData: false
+      testTargets: []

@@ -197,9 +197,15 @@ jobs:
           name: asset-android-arm64-apk
           path: release_assets/*
 
+  ios-ipa:
+    name: iOS arm64 IPA/TIPA
+    uses: ./.github/workflows/ios-ipa.yml
+    with:
+      version: ${{ github.event.inputs.version || github.ref_name }}
+
   release:
     name: Release
-    needs: [build, android-apk]
+    needs: [build, android-apk, ios-ipa]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -293,6 +299,8 @@ jobs:
             支持 macOS / Windows / Linux（ARM64、AMD64）。
 
             支持 Android（ARM64 APK）。
+
+            支持 TrollStore 兼容设备（iOS 14.0-16.6.1、16.7 RC、17.0）的 IPA/TIPA。
           files: artifacts/*
           draft: false
           prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease == 'true' || contains(steps.get-version.outputs.VERSION, '-') }}

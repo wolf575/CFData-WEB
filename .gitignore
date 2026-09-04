@@ -14,6 +14,15 @@ Thumbs.db
 
 .vscode/
 .idea/
+.tools/
+
+# iOS build outputs
+ios/CFDataIOS.xcodeproj/
+ios/DerivedData/
+ios/Payload/
+ios/Resources/cfdata
+ios/*.ipa
+ios/*.tipa
 
 *.exe
 *.exe~

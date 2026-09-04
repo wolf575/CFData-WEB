@@ -1,0 +1,60 @@
+name: Build iOS TrollStore Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string"
+        required: false
+        default: "1.0.0"
+        type: string
+  workflow_call:
+    inputs:
+      version:
+        description: "Version string"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ios-ipa:
+    name: iOS arm64 IPA/TIPA
+    runs-on: macos-14
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.4"
+          cache-dependency-path: combined_refactor/go.sum
+
+      - name: Download CA certificates
+        run: |
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            https://curl.se/ca/cacert.pem \
+            -o combined_refactor/ca-certificates.crt
+
+      - name: Install packaging tools
+        run: brew install ldid xcodegen
+
+      - name: Build and package
+        env:
+          VERSION: ${{ inputs.version || '1.0.0' }}
+        run: ./ios/build.sh
+
+      - name: Verify package contents
+        run: |
+          unzip -l ios/cfdata-ios-arm64.ipa
+          unzip -t ios/cfdata-ios-arm64.ipa
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-ios-arm64-tipa
+          path: |
+            ios/cfdata-ios-arm64.ipa
+            ios/cfdata-ios-arm64.tipa
