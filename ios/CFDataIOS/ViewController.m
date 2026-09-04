@@ -672,6 +672,11 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.loadingOverlayHidden = NO;
         self.webSocketWatchdogScheduled = NO;
+        self.pageLoadedSignalReceived = NO;
+        self.webSocketOpenedSignalReceived = NO;
+        self.backendExitObserved = NO;
+        self.backendExitStatus = 0;
+        self.backendExitDetail = @"none";
         self.loadingRetryButton.hidden = YES;
         self.loadingTitle.text = @"CFData";
         self.loadingTitle.textColor = [UIColor labelColor];
