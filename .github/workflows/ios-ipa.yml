@@ -6,7 +6,7 @@ on:
       version:
         description: "Version string"
         required: false
-        default: "1.0.0"
+        default: "1.0.5"
         type: string
   workflow_call:
     inputs:
@@ -45,7 +45,7 @@ jobs:
 
       - name: Build and package
         env:
-          VERSION: ${{ inputs.version || '1.0.0' }}
+          VERSION: ${{ inputs.version || '1.0.5' }}
         run: bash ios/build.sh
 
       - name: Verify package contents

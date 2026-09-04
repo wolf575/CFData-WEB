@@ -10,5 +10,6 @@
 
 - (void)stopBackend;
 - (void)flushLogsToDocuments;
++ (void)writeBootstrapLog;
 
 @end

@@ -28,8 +28,10 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Println("WebSocket 升级失败:", err)
+		runtimeLog("error", "websocket", "upgrade failed: "+err.Error())
 		return
 	}
+	runtimeLog("info", "websocket", "upgraded from "+r.RemoteAddr)
 
 	session := &appSession{ws: ws}
 	defer func() {
@@ -76,7 +78,12 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		cfCountry, cfCountryOK = detectCloudflareTraceCountry(ctx)
 		cancel()
 	}
-	defaultSpeedURL, speedISP, speedISPErr := resolveStartupSpeedTestURL(r.Context(), speedTestURL)
+	defaultSpeedURL := resolveSpeedTestURL(speedTestURL)
+	speedISP := ispProbeInfo{}
+	speedISPErr := error(nil)
+	if !isIOSMode() {
+		defaultSpeedURL, speedISP, speedISPErr = resolveStartupSpeedTestURL(r.Context(), speedTestURL)
+	}
 	if speedISPErr != nil {
 		recordDebugError("speed_isp_check", speedISPErr.Error())
 	}
@@ -98,17 +105,21 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if backgroundSession := currentBackgroundTaskSession(); backgroundSession != nil {
 		session.sendWSMessage("background_task_found", backgroundSession.backgroundSummary())
 	}
-	safeGo("version-check", session, func() {
-		ctx, cancel := context.WithTimeout(r.Context(), 7*time.Second)
-		defer cancel()
-		info, err := getLatestRelease(ctx)
-		if err != nil {
-			recordDebugError("version_check", err.Error())
-			session.sendWSMessage("version_info", map[string]interface{}{"version": appVersion, "releaseURL": releaseLatestURL, "error": err.Error()})
-			return
-		}
-		session.sendWSMessage("version_info", map[string]interface{}{"version": appVersion, "latest": info.TagName, "releaseURL": releaseLatestURL, "hasUpdate": versionIsOlder(appVersion, info.TagName)})
-	})
+	if isIOSMode() {
+		runtimeLog("info", "ios_startup", "version check skipped")
+	} else {
+		safeGo("version-check", session, func() {
+			ctx, cancel := context.WithTimeout(r.Context(), 7*time.Second)
+			defer cancel()
+			info, err := getLatestRelease(ctx)
+			if err != nil {
+				recordDebugError("version_check", err.Error())
+				session.sendWSMessage("version_info", map[string]interface{}{"version": appVersion, "releaseURL": releaseLatestURL, "error": err.Error()})
+				return
+			}
+			session.sendWSMessage("version_info", map[string]interface{}{"version": appVersion, "latest": info.TagName, "releaseURL": releaseLatestURL, "hasUpdate": versionIsOlder(appVersion, info.TagName)})
+		})
+	}
 
 	safeHandler := func(name string, fn func(json.RawMessage), data json.RawMessage) {
 		defer func() {

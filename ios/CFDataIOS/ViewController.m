@@ -1,20 +1,97 @@
 #import "ViewController.h"
 
+#import <arpa/inet.h>
 #import <crt_externs.h>
 #import <dispatch/dispatch.h>
 #import <errno.h>
 #import <fcntl.h>
+#import <netinet/in.h>
+#import <poll.h>
 #import <signal.h>
 #import <spawn.h>
 #import <stdlib.h>
 #import <string.h>
+#import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/types.h>
+#import <sys/wait.h>
 #import <unistd.h>
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
+static NSString *const kDiagnosticVersion = @"1.0.5";
+static NSString *const kLiveLogFileName = @"cfdata-live.log";
+static NSString *const kLastLogFileName = @"cfdata-last.log";
+static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
+static NSString *const kSystemRootLogPath = @"/var/mobile/Documents/cfdata-live.log";
 static const int kBackendPort = 13335;
+
+static BOOL CFDataCreateParentDirectory(NSString *path) {
+    NSString *parent = [path stringByDeletingLastPathComponent];
+    if (parent.length == 0 || [parent isEqualToString:path]) {
+        return NO;
+    }
+    NSError *error = nil;
+    BOOL created = [[NSFileManager defaultManager] createDirectoryAtPath:parent
+                                             withIntermediateDirectories:YES
+                                                              attributes:@{NSFilePosixPermissions : @0755}
+                                                                   error:&error];
+    return created;
+}
+
+static BOOL CFDataWriteAll(int fd, const void *bytes, size_t length) {
+    const char *buffer = bytes;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t result = write(fd, buffer + written, length - written);
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return NO;
+        }
+        written += (size_t)result;
+    }
+    return YES;
+}
+
+static void CFDataWriteStringToPath(NSString *content, NSString *path) {
+    if (path.length == 0) {
+        return;
+    }
+    CFDataCreateParentDirectory(path);
+    NSData *data = [content dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length == 0) {
+        data = [@"" dataUsingEncoding:NSUTF8StringEncoding];
+    }
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        NSLog(@"CFData log open failed %@ errno=%d (%s)", path, errno, strerror(errno));
+        return;
+    }
+    CFDataWriteAll(fd, data.bytes, data.length);
+    fsync(fd);
+    close(fd);
+}
+
+static void CFDataAppendStringToPath(NSString *content, NSString *path) {
+    if (path.length == 0) {
+        return;
+    }
+    CFDataCreateParentDirectory(path);
+    NSData *data = [content dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length == 0) {
+        return;
+    }
+    int fd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        return;
+    }
+    CFDataWriteAll(fd, data.bytes, data.length);
+    CFDataWriteAll(fd, "\n", 1);
+    fsync(fd);
+    close(fd);
+}
 
 @interface ViewController ()
 
@@ -22,19 +99,30 @@ static const int kBackendPort = 13335;
 @property (nonatomic, strong) UIView *loadingOverlay;
 @property (nonatomic, strong) UILabel *loadingTitle;
 @property (nonatomic, strong) UILabel *loadingMessage;
+@property (nonatomic, strong) UILabel *loadingDiagnosticLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *loadingSpinner;
 @property (nonatomic, strong) UIButton *loadingRetryButton;
+@property (nonatomic, strong) UIButton *loadingCopyButton;
+@property (nonatomic, strong) UIButton *loadingExportButton;
 @property (nonatomic, strong) NSString *dataDirectory;
 @property (nonatomic, strong) NSString *backendPath;
 @property (nonatomic, strong) NSURL *pendingExportURL;
 @property (nonatomic) pid_t backendPID;
+@property (nonatomic) int backendExitStatus;
+@property (nonatomic) BOOL backendExitObserved;
+@property (nonatomic, strong) NSString *backendExitDetail;
 @property (nonatomic) BOOL importPickerActive;
 @property (nonatomic) BOOL bridgeInjected;
+@property (nonatomic) BOOL pageLoadedSignalReceived;
+@property (nonatomic) BOOL webSocketOpenedSignalReceived;
+@property (nonatomic) BOOL webSocketWatchdogScheduled;
+@property (nonatomic) BOOL loadingOverlayHidden;
 @property (nonatomic, strong) NSMutableArray<NSString *> *runtimeLogLines;
 @property (nonatomic, strong) dispatch_queue_t logQueue;
 @property (nonatomic, strong) dispatch_source_t logTimer;
 @property (nonatomic, strong) NSString *documentsDirectory;
 @property (nonatomic, strong) NSString *logsDirectory;
+@property (nonatomic, strong) NSArray<NSString *> *logDirectories;
 @property (nonatomic, strong) NSString *liveLogPath;
 @property (nonatomic, strong) NSString *backendLogPath;
 @property (nonatomic, strong) NSString *backendDebugLogPath;
@@ -44,10 +132,47 @@ static const int kBackendPort = 13335;
 
 @implementation ViewController
 
++ (void)writeBootstrapLog {
+    NSString *home = NSHomeDirectory();
+    NSString *temp = NSTemporaryDirectory();
+    NSString *bundlePath = NSBundle.mainBundle.bundlePath;
+    NSString *documents =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)
+            .firstObject ?: @"";
+    NSString *message = [NSString stringWithFormat:
+        @"CFData iOS %@ process bootstrap\n"
+        @"time=%@\nuid=%d\nhome=%@\ntemp=%@\nbundle=%@\ndocuments=%@\n",
+        kDiagnosticVersion,
+        [NSDate date].description,
+        getuid(),
+        home ?: @"none",
+        temp ?: @"none",
+        bundlePath ?: @"none",
+        documents];
+
+    NSString *systemBootPath =
+        [kSystemLogDirectory stringByAppendingPathComponent:@"cfdata-boot.log"];
+    CFDataWriteStringToPath(message, systemBootPath);
+    if (documents.length > 0) {
+        CFDataWriteStringToPath(message,
+            [[documents stringByAppendingPathComponent:@"cfdata-logs"]
+                stringByAppendingPathComponent:@"cfdata-boot.log"]);
+    }
+    CFDataWriteStringToPath(message,
+        @"/var/mobile/Documents/cfdata-boot.log");
+    NSLog(@"%@", message);
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor systemBackgroundColor];
     self.backendPID = -1;
+    self.backendExitStatus = 0;
+    self.backendExitObserved = NO;
+    self.backendExitDetail = @"none";
+    self.pageLoadedSignalReceived = NO;
+    self.webSocketOpenedSignalReceived = NO;
+    self.webSocketWatchdogScheduled = NO;
     self.runtimeLogLines = [NSMutableArray array];
     self.logQueue = dispatch_queue_create("com.cfdata.web.log", DISPATCH_QUEUE_SERIAL);
     self.logDateFormatter = [[NSDateFormatter alloc] init];
@@ -57,6 +182,9 @@ static const int kBackendPort = 13335;
 
     [self configureDataDirectory];
     [self configureLoggingDirectories];
+    [self logEvent:@"info"
+             source:@"app"
+             detail:[NSString stringWithFormat:@"diagnosticVersion=%@", kDiagnosticVersion]];
     [self logEvent:@"info" source:@"app" detail:@"viewDidLoad"];
     [self configureWebView];
     [self configureLoadingOverlay];
@@ -104,22 +232,73 @@ static const int kBackendPort = 13335;
     self.backendDebugLogPath =
         [self.dataDirectory stringByAppendingPathComponent:@"cfdata-debug.log"];
 
-    NSError *error = nil;
-    [[NSFileManager defaultManager] createDirectoryAtPath:self.logsDirectory
+    NSMutableArray<NSString *> *logDirectories = [NSMutableArray array];
+    [logDirectories addObject:self.logsDirectory];
+    [logDirectories addObject:[NSTemporaryDirectory()
+                                  stringByAppendingPathComponent:@"cfdata-logs"]];
+    [logDirectories addObject:[self.dataDirectory
+                                  stringByAppendingPathComponent:@"cfdata-logs"]];
+
+    NSArray<NSString *> *cachePaths =
+        NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    if (cachePaths.firstObject.length > 0) {
+        [logDirectories addObject:[cachePaths.firstObject
+                                      stringByAppendingPathComponent:@"cfdata-logs"]];
+    }
+
+    NSString *homePath = NSHomeDirectory();
+    if (homePath.length > 0) {
+        [logDirectories addObject:[homePath
+                                      stringByAppendingPathComponent:@"Documents/cfdata-logs"]];
+    }
+
+    // TrollStore no-sandbox apps often do not expose their data container in
+    // Files. These system paths are visible from "On My iPhone" on many setups.
+    [logDirectories addObject:kSystemLogDirectory];
+    [logDirectories addObject:@"/var/mobile/Documents"];
+
+    NSMutableArray<NSString *> *uniqueDirectories = [NSMutableArray array];
+    for (NSString *directory in logDirectories) {
+        BOOL exists = NO;
+        for (NSString *existing in uniqueDirectories) {
+            if ([existing isEqualToString:directory]) {
+                exists = YES;
+                break;
+            }
+        }
+        if (!exists) {
+            [uniqueDirectories addObject:directory];
+        }
+    }
+    self.logDirectories = [uniqueDirectories copy];
+
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *directoryResults = [NSMutableArray array];
+    for (NSString *directory in self.logDirectories) {
+        NSError *error = nil;
+        BOOL created = [fileManager createDirectoryAtPath:directory
                               withIntermediateDirectories:YES
                                                attributes:@{NSFilePosixPermissions : @0755}
                                                     error:&error];
-    if (error != nil) {
-        NSLog(@"Unable to create CFData log directory: %@", error);
+        [directoryResults addObject:[NSString
+            stringWithFormat:@"%@=%@%@", directory, created ? @"ok" : @"failed",
+                             error == nil ? @"" : [NSString stringWithFormat:@":%@", error.localizedDescription]]];
     }
+
+    CFDataWriteStringToPath(
+        [NSString stringWithFormat:@"CFData iOS %@ bootstrap\nhome=%@\ntemp=%@\nlogDirectories=%@\n",
+                                   kDiagnosticVersion, NSHomeDirectory(), NSTemporaryDirectory(),
+                                   [directoryResults componentsJoinedByString:@"\n"]],
+        [kSystemLogDirectory stringByAppendingPathComponent:@"cfdata-boot.log"]);
 
     UIDevice *device = [UIDevice currentDevice];
     [self logEvent:@"info"
              source:@"app"
              detail:[NSString stringWithFormat:
-                                  @"device=%@ system=%@ %@ model=%@ documents=%@",
+                                  @"device=%@ system=%@ %@ model=%@ documents=%@ logDirs=%@",
                                   device.name, device.systemName, device.systemVersion,
-                                  device.model, self.documentsDirectory]];
+                                  device.model, self.documentsDirectory,
+                                  [directoryResults componentsJoinedByString:@"|"]]];
 }
 
 - (void)logEvent:(NSString *)level source:(NSString *)source detail:(NSString *)detail {
@@ -136,7 +315,11 @@ static const int kBackendPort = 13335;
     NSString *timestamp = [self.logDateFormatter stringFromDate:[NSDate date]];
     NSString *line = [NSString stringWithFormat:@"[%@] level=%@ source=%@ detail=%@",
                                                 timestamp, level, source, detail];
+    NSLog(@"%@", line);
 
+    // Every event is fsync'ed before returning to the caller. This keeps a
+    // useful trace even if applicationWillTerminate never gets a chance to run.
+    [self appendRuntimeLineImmediately:line];
     dispatch_async(self.logQueue, ^{
         @synchronized(self.runtimeLogLines) {
             [self.runtimeLogLines addObject:line];
@@ -145,13 +328,49 @@ static const int kBackendPort = 13335;
                     0, self.runtimeLogLines.count - 800)];
             }
         }
-        [self writeLiveLogSnapshotLocked];
     });
+}
+
+- (NSArray<NSString *> *)liveLogDestinationPaths {
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSString *directory in self.logDirectories ?: @[]) {
+        [paths addObject:[directory stringByAppendingPathComponent:kLiveLogFileName]];
+    }
+    [paths addObject:[kSystemLogDirectory stringByAppendingPathComponent:kLiveLogFileName]];
+    [paths addObject:kSystemRootLogPath];
+    return paths;
+}
+
+- (void)appendRuntimeLineImmediately:(NSString *)line {
+    for (NSString *path in [self liveLogDestinationPaths]) {
+        CFDataAppendStringToPath(line, path);
+    }
+}
+
+- (void)writeSnapshotToPaths:(NSString *)snapshot {
+    NSArray<NSString *> *paths = [self liveLogDestinationPaths];
+    for (NSString *path in paths) {
+        CFDataWriteStringToPath(snapshot, path);
+    }
+    for (NSString *directory in self.logDirectories ?: @[]) {
+        CFDataWriteStringToPath(snapshot,
+            [directory stringByAppendingPathComponent:kLastLogFileName]);
+    }
+    CFDataWriteStringToPath(snapshot,
+        [kSystemLogDirectory stringByAppendingPathComponent:kLastLogFileName]);
 }
 
 - (NSString *)buildLogSnapshotLocked {
     NSMutableString *snapshot = [NSMutableString string];
     [snapshot appendString:@"=== CFData iOS runtime log ===\n"];
+    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\n\n",
+     NSHomeDirectory(), NSTemporaryDirectory(),
+     [self.logDirectories componentsJoinedByString:@"\n"],
+     self.backendPID, self.backendExitStatus,
+     self.backendExitObserved ? @"YES" : @"NO",
+     self.backendExitDetail ?: @"none",
+     self.pageLoadedSignalReceived ? @"YES" : @"NO",
+     self.webSocketOpenedSignalReceived ? @"YES" : @"NO"];
     @synchronized(self.runtimeLogLines) {
         [snapshot appendString:[self.runtimeLogLines componentsJoinedByString:@"\n"]];
     }
@@ -201,8 +420,7 @@ static const int kBackendPort = 13335;
 
 - (void)writeLiveLogSnapshotLocked {
     NSString *snapshot = [self buildLogSnapshotLocked];
-    NSData *data = [snapshot dataUsingEncoding:NSUTF8StringEncoding];
-    [data writeToFile:self.liveLogPath atomically:YES];
+    [self writeSnapshotToPaths:snapshot];
 }
 
 - (void)startLogPump {
@@ -221,6 +439,7 @@ static const int kBackendPort = 13335;
         if (self == nil) {
             return;
         }
+        [self observeBackendExitIfNeeded];
         dispatch_async(self.logQueue, ^{
             [self writeLiveLogSnapshotLocked];
         });
@@ -236,26 +455,43 @@ static const int kBackendPort = 13335;
 }
 
 - (void)flushLogsToDocuments {
-    if (self.logQueue == nil || self.logsDirectory.length == 0) {
+    if (self.logQueue == nil) {
         return;
     }
     dispatch_sync(self.logQueue, ^{
         [self writeLiveLogSnapshotLocked];
+        NSString *snapshot = [self buildLogSnapshotLocked];
         NSString *timestamp =
             [self.logDateFormatter stringFromDate:[NSDate date]];
         NSString *safeTimestamp =
             [timestamp stringByReplacingOccurrencesOfString:@":" withString:@"-"];
         safeTimestamp = [safeTimestamp stringByReplacingOccurrencesOfString:@"." withString:@"-"];
-        NSString *path = [self.logsDirectory stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"cfdata-%@.log", safeTimestamp]];
-        NSString *snapshot = [self buildLogSnapshotLocked];
-        [[snapshot dataUsingEncoding:NSUTF8StringEncoding] writeToFile:path atomically:YES];
+        NSString *fileName = [NSString stringWithFormat:@"cfdata-%@.log", safeTimestamp];
+
+        NSArray<NSString *> *directories = self.logDirectories.count > 0
+            ? self.logDirectories
+            : @[];
+        for (NSString *directory in directories) {
+            NSString *path = [directory stringByAppendingPathComponent:fileName];
+            CFDataWriteStringToPath(snapshot, path);
+        }
+        CFDataWriteStringToPath(snapshot,
+            [kSystemLogDirectory stringByAppendingPathComponent:fileName]);
+        CFDataWriteStringToPath(snapshot,
+            [kSystemLogDirectory stringByAppendingPathComponent:kLastLogFileName]);
+        CFDataWriteStringToPath(snapshot, kSystemRootLogPath);
     });
 }
 
 - (void)configureWebView {
     WKUserContentController *contentController = [[WKUserContentController alloc] init];
     [contentController addScriptMessageHandler:self name:kBridgeMessageName];
+
+    WKUserScript *diagnosticScript =
+        [[WKUserScript alloc] initWithSource:[self runtimeDiagnosticScript]
+                               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                            forMainFrameOnly:YES];
+    [contentController addUserScript:diagnosticScript];
 
     WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
     configuration.userContentController = contentController;
@@ -280,6 +516,77 @@ static const int kBackendPort = 13335;
     ]];
 }
 
+- (NSString *)runtimeDiagnosticScript {
+    return @"(function(){"
+            "if(window.__cfdataIOSDiagnosticsInstalled)return;"
+            "window.__cfdataIOSDiagnosticsInstalled=true;"
+            "window.__cfdataIOSWebSocketState='none';"
+            "function report(kind,detail){"
+            "detail=String(detail||'').slice(0,2000);"
+            "try{if(window.webkit&&window.webkit.messageHandlers&&"
+            "window.webkit.messageHandlers.cfdata){"
+            "window.webkit.messageHandlers.cfdata.postMessage("
+            "{action:'runtimeDiagnostic',kind:kind,detail:detail});}}catch(e){}"
+            "}"
+            "function safeSummary(prefix,error){"
+            "try{return prefix+' '+(error&&error.message?error.message:String(error));}"
+            "catch(e){return prefix;}"
+            "}"
+            "report('lifecycle','document_start userAgent='+navigator.userAgent);"
+            "window.addEventListener('error',function(event){"
+            "report('error',safeSummary('window_error line='+(event.lineno||0)+"
+            "' col='+(event.colno||0),event.error||event.message));"
+            "},true);"
+            "window.addEventListener('unhandledrejection',function(event){"
+            "report('error',safeSummary('unhandledrejection',event.reason));"
+            "});"
+            "document.addEventListener('DOMContentLoaded',function(){"
+            "report('lifecycle','dom_content_loaded');"
+            "window.setTimeout(function(){"
+            "var text='';"
+            "try{text=document.body&&document.body.innerText?"
+            "document.body.innerText.slice(0,200):'';}catch(e){}"
+            "report('page_state','readyState='+document.readyState+"
+            "' title='+document.title+' text='+text);"
+            "},500);"
+            "});"
+            "window.addEventListener('load',function(){"
+            "report('lifecycle','window_load');"
+            "});"
+            "var NativeWebSocket=window.WebSocket;"
+            "var WrappedWebSocket=function(url,protocols){"
+            "var socket;"
+            "try{socket=protocols?new NativeWebSocket(url,protocols):"
+            "new NativeWebSocket(url);}"
+            "catch(error){report('websocket',safeSummary('create_failed',error));"
+            "throw error;}"
+            "report('websocket','create '+url);"
+            "socket.addEventListener('open',function(){"
+            "window.__cfdataIOSWebSocketState='open';"
+            "report('websocket','open');"
+            "});"
+            "socket.addEventListener('close',function(event){"
+            "window.__cfdataIOSWebSocketState='closed';"
+            "report('websocket','close code='+(event&&event.code)+"
+            "' reason='+(event&&event.reason));"
+            "});"
+            "socket.addEventListener('error',function(){"
+            "window.__cfdataIOSWebSocketState='error';"
+            "report('websocket','error');"
+            "});"
+            "return socket;"
+            "};"
+            "if(NativeWebSocket){"
+            "WrappedWebSocket.prototype=NativeWebSocket.prototype;"
+            "WrappedWebSocket.CONNECTING=NativeWebSocket.CONNECTING;"
+            "WrappedWebSocket.OPEN=NativeWebSocket.OPEN;"
+            "WrappedWebSocket.CLOSING=NativeWebSocket.CLOSING;"
+            "WrappedWebSocket.CLOSED=NativeWebSocket.CLOSED;"
+            "window.WebSocket=WrappedWebSocket;"
+            "}"
+            "})();";
+}
+
 - (void)configureLoadingOverlay {
     self.loadingOverlay = [[UIView alloc] initWithFrame:CGRectZero];
     self.loadingOverlay.backgroundColor = [UIColor systemBackgroundColor];
@@ -287,7 +594,7 @@ static const int kBackendPort = 13335;
     [self.view addSubview:self.loadingOverlay];
 
     self.loadingTitle = [[UILabel alloc] init];
-    self.loadingTitle.text = @"CFData";
+    self.loadingTitle.text = @"CFData 诊断版";
     self.loadingTitle.font = [UIFont boldSystemFontOfSize:24];
     self.loadingTitle.textColor = [UIColor labelColor];
     self.loadingTitle.textAlignment = NSTextAlignmentCenter;
@@ -298,6 +605,14 @@ static const int kBackendPort = 13335;
     self.loadingMessage.textColor = [UIColor secondaryLabelColor];
     self.loadingMessage.textAlignment = NSTextAlignmentCenter;
     self.loadingMessage.numberOfLines = 0;
+
+    self.loadingDiagnosticLabel = [[UILabel alloc] init];
+    self.loadingDiagnosticLabel.text =
+        [NSString stringWithFormat:@"版本 %@ | 启动阶段：初始化", kDiagnosticVersion];
+    self.loadingDiagnosticLabel.font = [UIFont systemFontOfSize:11];
+    self.loadingDiagnosticLabel.textColor = [UIColor tertiaryLabelColor];
+    self.loadingDiagnosticLabel.textAlignment = NSTextAlignmentCenter;
+    self.loadingDiagnosticLabel.numberOfLines = 0;
 
     self.loadingSpinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
@@ -310,10 +625,24 @@ static const int kBackendPort = 13335;
                       forControlEvents:UIControlEventTouchUpInside];
     self.loadingRetryButton.hidden = YES;
 
+    self.loadingCopyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.loadingCopyButton setTitle:@"复制诊断日志" forState:UIControlStateNormal];
+    [self.loadingCopyButton addTarget:self
+                               action:@selector(copyDiagnostics:)
+                     forControlEvents:UIControlEventTouchUpInside];
+
+    self.loadingExportButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.loadingExportButton setTitle:@"导出诊断日志" forState:UIControlStateNormal];
+    [self.loadingExportButton addTarget:self
+                                 action:@selector(exportDiagnostics:)
+                       forControlEvents:UIControlEventTouchUpInside];
+
     UIStackView *stackView =
         [[UIStackView alloc] initWithArrangedSubviews:@[
             self.loadingTitle, self.loadingMessage, self.loadingSpinner,
-            self.loadingRetryButton
+            self.loadingDiagnosticLabel, self.loadingCopyButton,
+            self.loadingRetryButton,
+            self.loadingExportButton
         ]];
     stackView.axis = UILayoutConstraintAxisVertical;
     stackView.alignment = UIStackViewAlignmentCenter;
@@ -341,6 +670,8 @@ static const int kBackendPort = 13335;
     [self logEvent:@"info" source:@"app" detail:@"startBackend requested"];
     [self stopBackend];
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.loadingOverlayHidden = NO;
+        self.webSocketWatchdogScheduled = NO;
         self.loadingRetryButton.hidden = YES;
         self.loadingTitle.text = @"CFData";
         self.loadingTitle.textColor = [UIColor labelColor];
@@ -416,6 +747,7 @@ static const int kBackendPort = 13335;
                 [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d",
                                                                   kBackendPort]];
             [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
+            [self scheduleStartupWatchdog];
         });
     });
 }
@@ -471,24 +803,30 @@ static const int kBackendPort = 13335;
 
     NSString *logPath =
         [self.dataDirectory stringByAppendingPathComponent:@"cfdata.log"];
+    NSString *portString = @(kBackendPort).stringValue;
+
+    const char *backendPathCString = backendPath.fileSystemRepresentation;
+    const char *logPathCString = logPath.fileSystemRepresentation;
+    const char *portCString = portString.UTF8String;
+
     posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO,
-                                     logPath.fileSystemRepresentation,
+                                     logPathCString,
                                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
 
     char *argv[] = {
-        (char *)backendPath.fileSystemRepresentation,
+        (char *)backendPathCString,
         "-host",
         "127.0.0.1",
         "-port",
-        (char *)[@(kBackendPort).stringValue UTF8String],
+        (char *)portCString,
         "-debug=all",
         "-skipgeo",
         NULL,
     };
 
     pid_t backendPID = -1;
-    int status = posix_spawn(&backendPID, backendPath.fileSystemRepresentation, &actions,
+    int status = posix_spawn(&backendPID, backendPathCString, &actions,
                              NULL, argv, *_NSGetEnviron());
     posix_spawn_file_actions_destroy(&actions);
 
@@ -522,9 +860,12 @@ static const int kBackendPort = 13335;
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45];
     NSUInteger attempt = 0;
     while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+        [self observeBackendExitIfNeeded];
         if (![self isBackendRunning]) {
             [self logEvent:@"error" source:@"startup"
-                    detail:@"backend process exited before health check passed"];
+                    detail:[NSString stringWithFormat:
+                                      @"backend process exited before health check passed; %@",
+                                      self.backendExitDetail ?: @"unknown status"]];
             return NO;
         }
         attempt++;
@@ -569,6 +910,42 @@ static const int kBackendPort = 13335;
             detail:[NSString stringWithFormat:@"health check timed out after %lu attempts",
                                               (unsigned long)attempt]];
     return NO;
+}
+
+- (void)observeBackendExitIfNeeded {
+    pid_t backendPID = -1;
+    @synchronized(self) {
+        backendPID = self.backendPID;
+    }
+    if (backendPID <= 0) {
+        return;
+    }
+
+    int status = 0;
+    pid_t result = waitpid(backendPID, &status, WNOHANG);
+    if (result != backendPID) {
+        return;
+    }
+
+    NSString *detail = @"unknown";
+    if (WIFEXITED(status)) {
+        detail = [NSString stringWithFormat:@"exited code=%d", WEXITSTATUS(status)];
+    } else if (WIFSIGNALED(status)) {
+        detail = [NSString stringWithFormat:@"signaled signal=%d", WTERMSIG(status)];
+    } else {
+        detail = [NSString stringWithFormat:@"waitpid status=0x%x", status];
+    }
+
+    @synchronized(self) {
+        if (self.backendPID == backendPID) {
+            self.backendPID = -1;
+        }
+        self.backendExitStatus = status;
+        self.backendExitObserved = YES;
+        self.backendExitDetail = detail;
+    }
+    [self logEvent:@"error" source:@"backend_process"
+            detail:[NSString stringWithFormat:@"pid=%d %@", backendPID, detail]];
 }
 
 - (NSData *)synchronousDataAtURL:(NSURL *)url
@@ -717,6 +1094,14 @@ static const int kBackendPort = 13335;
 - (void)updateLoadingMessage:(NSString *)message {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.loadingMessage.text = message;
+        if (self.loadingDiagnosticLabel != nil) {
+            NSString *timestamp =
+                [self.logDateFormatter stringFromDate:[NSDate date]];
+            self.loadingDiagnosticLabel.text =
+                [NSString stringWithFormat:@"版本 %@ | %@ | %@",
+                                           kDiagnosticVersion,
+                                           timestamp, message ?: @"正在处理"];
+        }
     });
 }
 
@@ -725,11 +1110,15 @@ static const int kBackendPort = 13335;
             detail:[NSString stringWithFormat:@"title=%@ message=%@", title,
                                               message ?: @"none"]];
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.loadingOverlayHidden = NO;
         self.loadingOverlay.hidden = NO;
         self.loadingOverlay.alpha = 1;
         self.loadingTitle.text = title;
         self.loadingTitle.textColor = [UIColor systemRedColor];
         self.loadingMessage.text = message;
+        self.loadingDiagnosticLabel.text =
+            [NSString stringWithFormat:@"版本 %@ | 错误 | %@ | 可点击复制或导出日志",
+                                       kDiagnosticVersion, title ?: @"启动失败"];
         [self.loadingSpinner stopAnimating];
         self.loadingSpinner.hidden = YES;
         self.loadingRetryButton.hidden = NO;
@@ -740,7 +1129,95 @@ static const int kBackendPort = 13335;
     [self startBackend];
 }
 
+- (void)scheduleStartupWatchdog {
+    if (self.webSocketWatchdogScheduled) {
+        return;
+    }
+    self.webSocketWatchdogScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.loadingOverlayHidden || self.webSocketOpenedSignalReceived) {
+            return;
+        }
+        NSString *state = self.pageLoadedSignalReceived
+            ? @"pageLoaded=YES webSocketOpen=NO"
+            : @"pageLoaded=NO webSocketOpen=NO";
+        [self logEvent:@"error" source:@"startup_watchdog"
+                detail:[NSString stringWithFormat:@"startup stuck for 15s; %@", state]];
+        [self showStartupError:@"界面未完成连接"
+                       message:@"页面加载超时，请点击“复制诊断日志”并把内容发给我；之后可以点击重试。"];
+    });
+}
+
+- (NSString *)diagnosticSnapshotOnLogQueue {
+    __block NSString *snapshot = @"";
+    if (self.logQueue != nil) {
+        dispatch_sync(self.logQueue, ^{
+            snapshot = [self buildLogSnapshotLocked];
+        });
+    } else {
+        snapshot = [self buildLogSnapshotLocked];
+    }
+    return snapshot;
+}
+
+- (void)copyDiagnostics:(UIButton *)sender {
+    NSString *snapshot = [self diagnosticSnapshotOnLogQueue];
+    UIPasteboard.generalPasteboard.string = snapshot;
+    [self logEvent:@"info" source:@"ui"
+            detail:[NSString stringWithFormat:@"diagnostic log copied (%lu bytes)",
+                                              (unsigned long)snapshot.length]];
+
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"日志已复制"
+                                            message:@"请粘贴到聊天窗口或备忘录中发给我。"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)exportDiagnostics:(UIButton *)sender {
+    [self logEvent:@"info" source:@"ui" detail:@"export diagnostics requested"];
+
+    if (self.logQueue == nil) {
+        [self showStartupError:@"导出失败" message:@"日志系统尚未初始化"];
+        return;
+    }
+
+    NSString *snapshot = [self diagnosticSnapshotOnLogQueue];
+
+    NSString *timestamp =
+        [self.logDateFormatter stringFromDate:[NSDate date]];
+    NSString *safeTimestamp =
+        [timestamp stringByReplacingOccurrencesOfString:@":" withString:@"-"];
+    safeTimestamp = [safeTimestamp stringByReplacingOccurrencesOfString:@"." withString:@"-"];
+    NSString *fileName =
+        [NSString stringWithFormat:@"cfdata-ios-diagnostics-%@.log", safeTimestamp];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
+    NSError *writeError = nil;
+    if (![[snapshot dataUsingEncoding:NSUTF8StringEncoding] writeToFile:path
+                                                                options:NSDataWritingAtomic
+                                                                  error:&writeError]) {
+        [self showStartupError:@"导出失败"
+                       message:writeError.localizedDescription ?: @"无法写入临时日志文件"];
+        return;
+    }
+
+    self.pendingExportURL = [NSURL fileURLWithPath:path isDirectory:NO];
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForExportingURLs:@[self.pendingExportURL]
+                                                               asCopy:YES];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
 - (void)hideLoadingOverlay {
+    if (self.loadingOverlayHidden) {
+        return;
+    }
+    self.loadingOverlayHidden = YES;
     [self logEvent:@"info" source:@"ui" detail:@"native loading overlay hidden"];
     [UIView animateWithDuration:0.18 animations:^{
         self.loadingOverlay.alpha = 0;
@@ -806,7 +1283,16 @@ static const int kBackendPort = 13335;
                                                                  error.localizedDescription ?: @"none"]];
                    }];
     [self injectExportBridge];
-    [self hideLoadingOverlay];
+    [self.webView evaluateJavaScript:@"!!window.__cfdataIOSDiagnosticsInstalled"
+                   completionHandler:^(id result, NSError *error) {
+                       [self logEvent:error == nil ? @"info" : @"warning"
+                               source:@"webview"
+                               detail:[NSString stringWithFormat:
+                                                 @"runtimeDiagnosticInstalled=%@ error=%@",
+                                                 result ?: @"none",
+                                                 error.localizedDescription ?: @"none"]];
+                   }];
+    [self updateLoadingMessage:@"页面已载入，正在等待界面连接..."];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -833,6 +1319,66 @@ static const int kBackendPort = 13335;
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
     [self logEvent:@"error" source:@"webview" detail:@"web content process terminated"];
     [self showStartupError:@"加载失败" message:@"网页进程已退出，请点击重试"];
+}
+
+- (void)handleRuntimeDiagnostic:(NSDictionary *)body {
+    NSString *kind = body[@"kind"];
+    NSString *detail = body[@"detail"];
+    if (kind.length == 0) {
+        kind = @"unknown";
+    }
+    if (detail.length == 0) {
+        detail = @"none";
+    }
+
+    BOOL isError = [kind isEqualToString:@"error"];
+    [self logEvent:isError ? @"error" : @"info"
+             source:@"web_runtime"
+             detail:[NSString stringWithFormat:@"kind=%@ detail=%@", kind, detail]];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([kind isEqualToString:@"websocket"]) {
+            if ([detail hasPrefix:@"open"]) {
+                self.webSocketOpenedSignalReceived = YES;
+                [self hideLoadingOverlay];
+            } else if ([detail hasPrefix:@"create"]) {
+                [self updateLoadingMessage:@"WebSocket 正在创建..."];
+            } else if ([detail hasPrefix:@"close"] && self.loadingDiagnosticLabel != nil) {
+                self.loadingDiagnosticLabel.text =
+                    [NSString stringWithFormat:@"版本 %@ | WebSocket 已关闭 | %@",
+                                               kDiagnosticVersion, detail];
+            } else if ([detail hasPrefix:@"error"] && self.loadingDiagnosticLabel != nil) {
+                self.loadingDiagnosticLabel.text =
+                    [NSString stringWithFormat:@"版本 %@ | WebSocket 错误 | %@",
+                                               kDiagnosticVersion, detail];
+            }
+            return;
+        }
+
+        if ([kind isEqualToString:@"lifecycle"] && [detail hasPrefix:@"window_load"]) {
+            self.pageLoadedSignalReceived = YES;
+            if (!self.webSocketOpenedSignalReceived) {
+                [self updateLoadingMessage:@"页面已载入，但尚未连接后端"];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                                   if (!self.webSocketOpenedSignalReceived) {
+                                       [self updateLoadingMessage:
+                                           @"页面已载入，但 WebSocket 尚未连接；请点击“复制诊断日志”"];
+                                   }
+                               });
+            }
+            return;
+        }
+
+        if ([kind isEqualToString:@"lifecycle"] && [detail hasPrefix:@"dom_content_loaded"]) {
+            self.pageLoadedSignalReceived = YES;
+        }
+
+        if (isError && self.loadingDiagnosticLabel != nil) {
+            self.loadingDiagnosticLabel.text =
+                [NSString stringWithFormat:@"版本 %@ | 页面错误 | %@", kDiagnosticVersion, detail];
+        }
+    });
 }
 
 - (void)injectExportBridge {
@@ -894,6 +1440,8 @@ static const int kBackendPort = 13335;
         [self saveTextFileNamed:body[@"name"] content:body[@"content"]];
     } else if ([action isEqualToString:@"pickTextFile"]) {
         [self presentImportPicker];
+    } else if ([action isEqualToString:@"runtimeDiagnostic"]) {
+        [self handleRuntimeDiagnostic:body];
     }
 }
 

@@ -6,6 +6,7 @@
 
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    [ViewController writeBootstrapLog];
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     self.rootViewController = [[ViewController alloc] init];
     self.window.rootViewController = self.rootViewController;

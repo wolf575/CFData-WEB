@@ -297,9 +297,17 @@ func main() {
 		configureHTTPClients()
 		markHTTPClientConfigured()
 		runtimeLog("info", "startup", "HTTP clients ready; loading locations and speed settings")
-		go checkAndPrintUpdate("")
+		if !isIOSMode() {
+			go checkAndPrintUpdate("")
+		} else {
+			runtimeLog("info", "ios_startup", "update check skipped")
+		}
 		initLocations()
-		warmStartupSpeedTestURL()
+		if !isIOSMode() {
+			warmStartupSpeedTestURL()
+		} else {
+			runtimeLog("info", "ios_startup", "startup speed probe skipped")
+		}
 		runtimeLog("info", "startup", "background initialization finished")
 	}()
 

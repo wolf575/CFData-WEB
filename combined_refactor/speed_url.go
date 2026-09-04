@@ -7,12 +7,17 @@ import (
 	"fmt"
 	"math/big"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
 const autoSpeedURLValue = "auto"
+
+func isIOSMode() bool {
+	return os.Getenv("CFDATA_IOS") == "1"
+}
 
 const (
 	cmSpeedURL              = "cf.090227.xyz/__down?bytes=99999999"
@@ -61,6 +66,9 @@ func resolveStartupSpeedTestURL(ctx context.Context, rawURL string) (string, isp
 	value := strings.TrimSpace(rawURL)
 	if value == "" {
 		value = autoSpeedURLValue
+	}
+	if isIOSMode() {
+		return resolveSpeedTestURL(value), ispProbeInfo{}, nil
 	}
 	if !isAutoSpeedURL(value) {
 		return value, ispProbeInfo{}, nil
