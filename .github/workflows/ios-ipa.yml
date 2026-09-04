@@ -44,7 +44,7 @@ jobs:
       - name: Build and package
         env:
           VERSION: ${{ inputs.version || '1.0.0' }}
-        run: ./ios/build.sh
+        run: bash ios/build.sh
 
       - name: Verify package contents
         run: |
