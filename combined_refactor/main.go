@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -180,18 +181,7 @@ func main() {
 	}
 	speedTestWorkers = cliCfg.speedTest
 	configureHTTPClients()
-	startupSpeedTestURL := speedTestURL
-	if !cliCfg.enabled {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resolvedSpeedURL, speedISP, err := resolveStartupSpeedTestURL(ctx, speedTestURL)
-		cancel()
-		if err != nil {
-			recordDebugError("speed_isp_check", err.Error())
-		} else {
-			startupSpeedTestURL = resolvedSpeedURL
-			recordDebugByLevel("all", "speed_isp_check", fmt.Sprintf("startup asn=%d org=%s mobile=%v selected=%s", speedISP.ASN, speedISP.ASOrganization, isChinaMobileISP(speedISP), currentAutoSpeedURLDefault()))
-		}
-	}
+	startupSpeedTestURL := resolveSpeedTestURL(speedTestURL)
 	if webSessionMinutes <= 0 {
 		webSessionMinutes = 720
 	}
@@ -205,8 +195,8 @@ func main() {
 			fmt.Printf("[config] 已生成配置文件模板: %s\n", cfgPath)
 		}
 	}
-	initLocations()
 	if cliCfg.enabled {
+		initLocations()
 		if err := runCLI(cliCfg); err != nil {
 			recordProgramDebugError("cli_run", err.Error())
 			fmt.Printf("CLI 执行失败: %v\n", err)
@@ -276,11 +266,24 @@ func main() {
 	}
 	fmt.Printf("服务启动于 %s\n", displayURL)
 	fmt.Printf("服务启动成功，复制 %s 到浏览器打开\n", displayURL)
+
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("启动失败: %v\n", err)
+		return
+	}
 	server := &http.Server{
-		Addr:              addr,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if err := server.ListenAndServe(); err != nil {
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- server.Serve(listener)
+	}()
+
+	go initLocations()
+	go warmStartupSpeedTestURL()
+
+	if err := <-serverErrors; err != nil {
 		fmt.Printf("启动失败: %v\n", err)
 	}
 }

@@ -204,7 +204,7 @@ func scanNSBEntryHTTP(ctx context.Context, item string, fallbackPort int, enable
 		return nil, &nsbFailureRecord{index: inputIndex, ipAddr: ipAddr, port: portStr, phase: "scan", reason: "数据中心不匹配", detail: fmt.Sprintf("colo=%s, target=%s", dataCenter, targetDC)}
 	}
 
-	loc := locationMap[dataCenter]
+	loc := locationForDataCenter(dataCenter)
 	asnNumber, asnOrg := lookupASN(trace["ip"])
 	return &iptestResult{
 		ipAddr:      ipAddr,
@@ -360,7 +360,7 @@ func scanNSBEntry(ctx context.Context, item string, fallbackPort int, enableTLS 
 		return nil, &nsbFailureRecord{index: inputIndex, ipAddr: ipAddr, port: portStr, phase: "scan", reason: "数据中心不匹配", detail: fmt.Sprintf("colo=%s, target=%s", dataCenter, targetDC)}
 	}
 
-	loc := locationMap[dataCenter]
+	loc := locationForDataCenter(dataCenter)
 	asnNumber, asnOrg := lookupASN(trace["ip"])
 	return &iptestResult{
 		ipAddr:      ipAddr,
@@ -976,28 +976,28 @@ func nsbMessageToResult(row nsbScanMessage) (iptestResult, bool) {
 		return iptestResult{}, false
 	}
 	return iptestResult{
-		ipAddr:       strings.TrimSpace(row.IP),
-		port:         port,
-		dataCenter:   row.DC,
-		locCode:      row.Loc,
-		region:       row.Region,
-		city:         row.City,
-		latency:      row.Latency,
-		lossRate:     parsePercent(row.LossRate),
-		outboundIP:   row.OutboundIP,
-		ipType:       row.IPType,
-		asnNumber:    row.ASNNumber,
-		asnOrg:       row.ASNOrg,
-		visitScheme:  firstNonEmpty(row.VisitScheme, mapBoolTLS(row.TLS)),
-		tlsVersion:   row.TLSVersion,
-		sni:          row.SNI,
-		httpVersion:  row.HTTPVersion,
-		warp:         row.Warp,
-		gateway:      row.Gateway,
-		rbi:          row.RBI,
-		kex:          row.Kex,
-		timestamp:    row.Timestamp,
-		speedText:    row.Speed,
+		ipAddr:        strings.TrimSpace(row.IP),
+		port:          port,
+		dataCenter:    row.DC,
+		locCode:       row.Loc,
+		region:        row.Region,
+		city:          row.City,
+		latency:       row.Latency,
+		lossRate:      parsePercent(row.LossRate),
+		outboundIP:    row.OutboundIP,
+		ipType:        row.IPType,
+		asnNumber:     row.ASNNumber,
+		asnOrg:        row.ASNOrg,
+		visitScheme:   firstNonEmpty(row.VisitScheme, mapBoolTLS(row.TLS)),
+		tlsVersion:    row.TLSVersion,
+		sni:           row.SNI,
+		httpVersion:   row.HTTPVersion,
+		warp:          row.Warp,
+		gateway:       row.Gateway,
+		rbi:           row.RBI,
+		kex:           row.Kex,
+		timestamp:     row.Timestamp,
+		speedText:     row.Speed,
 		originalInput: row.OriginalInput,
 	}, true
 }

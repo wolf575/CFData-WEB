@@ -21,6 +21,7 @@ static const int kBackendPort = 13335;
 @property (nonatomic, strong) UILabel *loadingTitle;
 @property (nonatomic, strong) UILabel *loadingMessage;
 @property (nonatomic, strong) UIActivityIndicatorView *loadingSpinner;
+@property (nonatomic, strong) UIButton *loadingRetryButton;
 @property (nonatomic, strong) NSString *dataDirectory;
 @property (nonatomic, strong) NSString *backendPath;
 @property (nonatomic, strong) NSURL *pendingExportURL;
@@ -120,9 +121,17 @@ static const int kBackendPort = 13335;
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
     [self.loadingSpinner startAnimating];
 
+    self.loadingRetryButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.loadingRetryButton setTitle:@"重试" forState:UIControlStateNormal];
+    [self.loadingRetryButton addTarget:self
+                                action:@selector(retryStartup:)
+                      forControlEvents:UIControlEventTouchUpInside];
+    self.loadingRetryButton.hidden = YES;
+
     UIStackView *stackView =
         [[UIStackView alloc] initWithArrangedSubviews:@[
-            self.loadingTitle, self.loadingMessage, self.loadingSpinner
+            self.loadingTitle, self.loadingMessage, self.loadingSpinner,
+            self.loadingRetryButton
         ]];
     stackView.axis = UILayoutConstraintAxisVertical;
     stackView.alignment = UIStackViewAlignmentCenter;
@@ -147,6 +156,15 @@ static const int kBackendPort = 13335;
 }
 
 - (void)startBackend {
+    [self stopBackend];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.loadingRetryButton.hidden = YES;
+        self.loadingTitle.text = @"CFData";
+        self.loadingTitle.textColor = [UIColor labelColor];
+        self.loadingSpinner.hidden = NO;
+        [self.loadingSpinner startAnimating];
+    });
+
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         [self updateLoadingMessage:@"正在准备本地服务..."];
 
@@ -176,8 +194,12 @@ static const int kBackendPort = 13335;
 
         [self updateLoadingMessage:@"正在连接本地服务..."];
         if (![self waitForBackend]) {
-            [self showStartupError:@"启动失败"
-                           message:@"本地服务启动超时，请重新打开应用"];
+            NSString *message = @"本地服务启动超时";
+            NSString *logTail = [self backendLogTail];
+            if (logTail.length > 0) {
+                message = [message stringByAppendingFormat:@"\n\n%@", logTail];
+            }
+            [self showStartupError:@"启动失败" message:message];
             return;
         }
 
@@ -271,8 +293,11 @@ static const int kBackendPort = 13335;
     configuration.timeoutIntervalForRequest = 0.8;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
 
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45];
     while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+        if (![self isBackendRunning]) {
+            return NO;
+        }
         __block BOOL ready = NO;
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         [[session dataTaskWithURL:healthURL
@@ -291,6 +316,49 @@ static const int kBackendPort = 13335;
         usleep(250 * 1000);
     }
     return NO;
+}
+
+- (BOOL)isBackendRunning {
+    pid_t backendPID = -1;
+    @synchronized(self) {
+        backendPID = self.backendPID;
+    }
+    if (backendPID <= 0) {
+        return NO;
+    }
+    if (kill(backendPID, 0) == 0) {
+        return YES;
+    }
+    return errno == EPERM;
+}
+
+- (NSString *)backendLogTail {
+    NSString *logPath =
+        [self.dataDirectory stringByAppendingPathComponent:@"cfdata.log"];
+    NSError *error = nil;
+    NSString *content =
+        [NSString stringWithContentsOfFile:logPath
+                                  encoding:NSUTF8StringEncoding
+                                     error:&error];
+    if (content.length == 0) {
+        return nil;
+    }
+
+    NSArray<NSString *> *lines =
+        [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *filtered = [NSMutableArray array];
+    for (NSString *line in lines) {
+        if (line.length > 0) {
+            [filtered addObject:line];
+        }
+    }
+    if (filtered.count == 0) {
+        return nil;
+    }
+    NSUInteger lineCount = MIN(filtered.count, 6);
+    NSArray<NSString *> *tail = [filtered
+        subarrayWithRange:NSMakeRange(filtered.count - lineCount, lineCount)];
+    return [tail componentsJoinedByString:@"\n"];
 }
 
 - (void)stopBackend {
@@ -319,7 +387,12 @@ static const int kBackendPort = 13335;
         self.loadingMessage.text = message;
         [self.loadingSpinner stopAnimating];
         self.loadingSpinner.hidden = YES;
+        self.loadingRetryButton.hidden = NO;
     });
+}
+
+- (void)retryStartup:(UIButton *)sender {
+    [self startBackend];
 }
 
 - (void)hideLoadingOverlay {

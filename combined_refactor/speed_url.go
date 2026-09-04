@@ -134,6 +134,17 @@ func pickMobileSpeedURL() string {
 	return urls[idx]
 }
 
+func warmStartupSpeedTestURL() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resolvedSpeedURL, speedISP, err := resolveStartupSpeedTestURL(ctx, speedTestURL)
+	if err != nil {
+		recordDebugError("speed_isp_check", err.Error())
+		return
+	}
+	recordDebugByLevel("all", "speed_isp_check", fmt.Sprintf("startup asn=%d org=%s mobile=%v selected=%s", speedISP.ASN, speedISP.ASOrganization, isChinaMobileISP(speedISP), resolvedSpeedURL))
+}
+
 func parseSpeedTestURL(rawURL string, fallbackScheme string) (*url.URL, error) {
 	value := resolveSpeedTestURL(rawURL)
 	if strings.TrimSpace(value) == "" {
