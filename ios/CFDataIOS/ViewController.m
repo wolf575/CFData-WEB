@@ -19,7 +19,7 @@
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
-static NSString *const kDiagnosticVersion = @"1.0.5";
+static NSString *const kDiagnosticVersion = @"1.0.6";
 static NSString *const kLiveLogFileName = @"cfdata-live.log";
 static NSString *const kLastLogFileName = @"cfdata-last.log";
 static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
@@ -117,6 +117,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 @property (nonatomic) BOOL webSocketOpenedSignalReceived;
 @property (nonatomic) BOOL webSocketWatchdogScheduled;
 @property (nonatomic) BOOL loadingOverlayHidden;
+@property (nonatomic) NSUInteger webViewProbeCount;
 @property (nonatomic, strong) NSMutableArray<NSString *> *runtimeLogLines;
 @property (nonatomic, strong) dispatch_queue_t logQueue;
 @property (nonatomic, strong) dispatch_source_t logTimer;
@@ -173,6 +174,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     self.pageLoadedSignalReceived = NO;
     self.webSocketOpenedSignalReceived = NO;
     self.webSocketWatchdogScheduled = NO;
+    self.webViewProbeCount = 0;
     self.runtimeLogLines = [NSMutableArray array];
     self.logQueue = dispatch_queue_create("com.cfdata.web.log", DISPATCH_QUEUE_SERIAL);
     self.logDateFormatter = [[NSDateFormatter alloc] init];
@@ -317,9 +319,19 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                                                 timestamp, level, source, detail];
     NSLog(@"%@", line);
 
-    // Every event is fsync'ed before returning to the caller. This keeps a
-    // useful trace even if applicationWillTerminate never gets a chance to run.
-    [self appendRuntimeLineImmediately:line];
+    // WKScriptMessageHandler runs on the UI thread. Keep this path allocation
+    // and queueing only; the log pump persists the in-memory ring on a
+    // background queue, and application close flushes a timestamped file.
+    if (self.logQueue == nil) {
+        @synchronized(self.runtimeLogLines) {
+            [self.runtimeLogLines addObject:line];
+            if (self.runtimeLogLines.count > 800) {
+                [self.runtimeLogLines removeObjectsInRange:NSMakeRange(
+                    0, self.runtimeLogLines.count - 800)];
+            }
+        }
+        return;
+    }
     dispatch_async(self.logQueue, ^{
         @synchronized(self.runtimeLogLines) {
             [self.runtimeLogLines addObject:line];
@@ -518,42 +530,65 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
 - (NSString *)runtimeDiagnosticScript {
     return @"(function(){"
-            "if(window.__cfdataIOSDiagnosticsInstalled)return;"
+            "if(window.__cfdataIOSDiagnosticsInstalled){return;}"
             "window.__cfdataIOSDiagnosticsInstalled=true;"
             "window.__cfdataIOSWebSocketState='none';"
+            "window.__cfdataIOSDiagnosticStage='script_start';"
             "function report(kind,detail){"
-            "detail=String(detail||'').slice(0,2000);"
+            "var text;try{text=String(detail||'').slice(0,1400);}"
+            "catch(e){text='diagnostic_detail_error';}"
+            "var handler=null;"
             "try{if(window.webkit&&window.webkit.messageHandlers&&"
             "window.webkit.messageHandlers.cfdata){"
-            "window.webkit.messageHandlers.cfdata.postMessage("
-            "{action:'runtimeDiagnostic',kind:kind,detail:detail});}}catch(e){}"
+            "handler=window.webkit.messageHandlers.cfdata;}}catch(e){}"
+            "if(!handler){return;}"
+            "var payload={action:'runtimeDiagnostic',kind:kind,detail:text};"
+            "window.setTimeout(function(){"
+            "try{handler.postMessage(payload);}catch(e){}"
+            "},0);"
+            "}"
+            "function stage(name){"
+            "try{window.__cfdataIOSDiagnosticStage=name;}catch(e){}"
+            "report('stage',name);"
             "}"
             "function safeSummary(prefix,error){"
             "try{return prefix+' '+(error&&error.message?error.message:String(error));}"
             "catch(e){return prefix;}"
             "}"
+            "function install(name,listener){"
+            "try{window.addEventListener(name,listener);stage('registered_'+name);}"
+            "catch(error){report('error','register_failed name='+name+' '"
+            "+safeSummary('message=',error));}"
+            "}"
             "report('lifecycle','document_start userAgent='+navigator.userAgent);"
-            "window.addEventListener('error',function(event){"
+            "stage('document_start_reported');"
+            "install('error',function(event){"
             "report('error',safeSummary('window_error line='+(event.lineno||0)+"
             "' col='+(event.colno||0),event.error||event.message));"
-            "},true);"
-            "window.addEventListener('unhandledrejection',function(event){"
+            "});"
+            "install('unhandledrejection',function(event){"
             "report('error',safeSummary('unhandledrejection',event.reason));"
             "});"
-            "document.addEventListener('DOMContentLoaded',function(){"
-            "report('lifecycle','dom_content_loaded');"
+            "install('DOMContentLoaded',function(){"
+            "stage('dom_content_loaded');"
+            "report('lifecycle','dom_content_loaded readyState='+document.readyState);"
             "window.setTimeout(function(){"
             "var text='';"
             "try{text=document.body&&document.body.innerText?"
-            "document.body.innerText.slice(0,200):'';}catch(e){}"
+            "document.body.innerText.slice(0,240):'';}catch(e){}"
             "report('page_state','readyState='+document.readyState+"
             "' title='+document.title+' text='+text);"
             "},500);"
             "});"
-            "window.addEventListener('load',function(){"
+            "install('load',function(){"
+            "stage('window_load');"
             "report('lifecycle','window_load');"
             "});"
-            "var NativeWebSocket=window.WebSocket;"
+            "var NativeWebSocket=null;"
+            "try{NativeWebSocket=window.WebSocket;}catch(error){"
+            "report('error',safeSummary('websocket_capture_failed',error));}"
+            "if(NativeWebSocket){"
+            "try{"
             "var WrappedWebSocket=function(url,protocols){"
             "var socket;"
             "try{socket=protocols?new NativeWebSocket(url,protocols):"
@@ -576,14 +611,21 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "});"
             "return socket;"
             "};"
-            "if(NativeWebSocket){"
             "WrappedWebSocket.prototype=NativeWebSocket.prototype;"
             "WrappedWebSocket.CONNECTING=NativeWebSocket.CONNECTING;"
             "WrappedWebSocket.OPEN=NativeWebSocket.OPEN;"
             "WrappedWebSocket.CLOSING=NativeWebSocket.CLOSING;"
             "WrappedWebSocket.CLOSED=NativeWebSocket.CLOSED;"
             "window.WebSocket=WrappedWebSocket;"
+            "stage('websocket_wrapped');"
+            "}catch(error){report('error',safeSummary('websocket_wrap_failed',error));}"
             "}"
+            "var heartbeatTicks=0;"
+            "try{window.setInterval(function(){"
+            "heartbeatTicks++;"
+            "report('heartbeat','tick='+heartbeatTicks+' readyState='+document.readyState);"
+            "},1000);}catch(error){report('error',safeSummary('heartbeat_failed',error));}"
+            "stage('script_end');"
             "})();";
 }
 
@@ -672,6 +714,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.loadingOverlayHidden = NO;
         self.webSocketWatchdogScheduled = NO;
+        self.webViewProbeCount = 0;
         self.pageLoadedSignalReceived = NO;
         self.webSocketOpenedSignalReceived = NO;
         self.backendExitObserved = NO;
@@ -1268,6 +1311,86 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     [self logEvent:@"info" source:@"webview"
             detail:[NSString stringWithFormat:@"didCommitNavigation url=%@",
                                               webView.URL.absoluteString ?: @"none"]];
+    [self scheduleWebViewRuntimeProbes];
+}
+
+- (void)scheduleWebViewRuntimeProbes {
+    if (self.loadingOverlayHidden) {
+        return;
+    }
+
+    NSUInteger probeNumber = 0;
+    @synchronized(self) {
+        self.webViewProbeCount += 1;
+        probeNumber = self.webViewProbeCount;
+    }
+    if (probeNumber > 20) {
+        return;
+    }
+
+    NSString *script =
+        @"JSON.stringify({readyState:document.readyState,title:document.title,"
+         "hasBody:!!document.body,bodyText:document.body?document.body.innerText.slice(0,120):'',"
+         "installed:!!window.__cfdataIOSDiagnosticsInstalled,"
+         "stage:window.__cfdataIOSDiagnosticStage||''})";
+    __weak typeof(self) weakSelf = self;
+    [self.webView evaluateJavaScript:script
+                   completionHandler:^(id result, NSError *error) {
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self == nil || self.loadingOverlayHidden) {
+                           return;
+                       }
+
+                       NSString *raw = [result isKindOfClass:[NSString class]]
+                           ? (NSString *)result
+                           : @"none";
+                       BOOL parsedOK = NO;
+                       NSDictionary *state = nil;
+                       if ([result isKindOfClass:[NSString class]]) {
+                           NSData *jsonData = [(NSString *)result
+                               dataUsingEncoding:NSUTF8StringEncoding];
+                           if (jsonData != nil) {
+                               id object = [NSJSONSerialization JSONObjectWithData:jsonData
+                                                                           options:0
+                                                                             error:nil];
+                               if ([object isKindOfClass:[NSDictionary class]]) {
+                                   state = (NSDictionary *)object;
+                                   parsedOK = YES;
+                               }
+                           }
+                       }
+
+                       NSString *readyState = state[@"readyState"];
+                       NSString *bodyText = state[@"bodyText"];
+                       BOOL pageIsInteractive =
+                           [readyState isEqualToString:@"interactive"] ||
+                           [readyState isEqualToString:@"complete"] ||
+                           ([bodyText isKindOfClass:[NSString class]] &&
+                            [bodyText containsString:@"Cloudflare IP Data"]);
+                       [self logEvent:parsedOK ? @"info" : @"warning"
+                               source:@"webview_probe"
+                               detail:[NSString stringWithFormat:
+                                                    @"tick=%lu raw=%@ error=%@ interactive=%@",
+                                                    (unsigned long)probeNumber,
+                                                    raw ?: @"none",
+                                                    error.localizedDescription ?: @"none",
+                                                    pageIsInteractive ? @"YES" : @"NO"]];
+
+                       if (pageIsInteractive) {
+                           self.pageLoadedSignalReceived = YES;
+                           [self updateLoadingMessage:@"页面已载入，正在连接后端..."];
+                           [self hideLoadingOverlay];
+                           return;
+                       }
+                   }];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self != nil) {
+                           [self scheduleWebViewRuntimeProbes];
+                       }
+                   });
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1298,6 +1421,8 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                                                  error.localizedDescription ?: @"none"]];
                    }];
     [self updateLoadingMessage:@"页面已载入，正在等待界面连接..."];
+    self.pageLoadedSignalReceived = YES;
+    [self hideLoadingOverlay];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1377,6 +1502,8 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
         if ([kind isEqualToString:@"lifecycle"] && [detail hasPrefix:@"dom_content_loaded"]) {
             self.pageLoadedSignalReceived = YES;
+            [self updateLoadingMessage:@"页面已载入，正在连接后端..."];
+            [self hideLoadingOverlay];
         }
 
         if (isError && self.loadingDiagnosticLabel != nil) {
