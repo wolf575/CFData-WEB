@@ -1,5 +1,6 @@
 #import "ViewController.h"
 
+#import <crt_externs.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <signal.h>
@@ -23,8 +24,8 @@ static const int kBackendPort = 13335;
 @property (nonatomic, strong) NSString *dataDirectory;
 @property (nonatomic, strong) NSString *backendPath;
 @property (nonatomic, strong) NSURL *pendingExportURL;
-@property (nonatomic, copy) void (^openPanelCompletion)(NSArray<NSURL *> *_Nullable);
 @property (nonatomic) pid_t backendPID;
+@property (nonatomic) BOOL importPickerActive;
 @property (nonatomic) BOOL bridgeInjected;
 
 @end
@@ -244,7 +245,7 @@ static const int kBackendPort = 13335;
 
     pid_t backendPID = -1;
     int status = posix_spawn(&backendPID, backendPath.fileSystemRepresentation, &actions,
-                             NULL, argv, environ);
+                             NULL, argv, *_NSGetEnviron());
     posix_spawn_file_actions_destroy(&actions);
 
     if (status != 0) {
@@ -377,6 +378,26 @@ static const int kBackendPort = 13335;
                          "window.webkit.messageHandlers.cfdata.postMessage("
                          "{action:'saveTextFile',name:name,content:content});"
                          "};"
+                         "window.__cfdataOriginalFileInputClick=HTMLInputElement.prototype.click;"
+                         "HTMLInputElement.prototype.click=function(){"
+                         "if(this.id==='nsbFileInput'){"
+                         "window.webkit.messageHandlers.cfdata.postMessage("
+                         "{action:'pickTextFile'});return;}"
+                         "return window.__cfdataOriginalFileInputClick.call(this);};"
+                         "window.__cfdataHandlePickedFile=function(name,content){"
+                         "var input=document.getElementById('nsbFileInput');if(!input)return;"
+                         "var file=new File([String(content)],String(name),{type:'text/plain'});"
+                         "if(typeof DataTransfer!=='undefined'){"
+                         "var dt=new DataTransfer();dt.items.add(file);"
+                         "try{Object.defineProperty(input,'files',{value:dt.files,"
+                         "configurable:true});}catch(e){}"
+                         "}else{"
+                         "var files=[file];files.item=function(i){return this[i];};"
+                         "try{Object.defineProperty(input,'files',{value:files,"
+                         "configurable:true});}catch(e){}"
+                         "}"
+                         "input.dispatchEvent(new Event('change',{bubbles:true}));"
+                         "};"
                          "window.downloadFile=function(content,nameBase,ext){"
                          "var ts=new Date().toISOString().replace(/[-:T]/g,'')"
                          ".split('.')[0];"
@@ -400,7 +421,60 @@ static const int kBackendPort = 13335;
     NSString *action = body[@"action"];
     if ([action isEqualToString:@"saveTextFile"]) {
         [self saveTextFileNamed:body[@"name"] content:body[@"content"]];
+    } else if ([action isEqualToString:@"pickTextFile"]) {
+        [self presentImportPicker];
     }
+}
+
+- (void)presentImportPicker {
+    NSArray<UTType *> *contentTypes = @[UTTypeText, UTTypeCommaSeparatedText];
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes
+                                                                   asCopy:YES];
+    picker.allowsMultipleSelection = NO;
+    picker.delegate = self;
+    self.importPickerActive = YES;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)handlePickedFileAtURL:(NSURL *)fileURL {
+    NSString *name = fileURL.lastPathComponent.length > 0
+                         ? fileURL.lastPathComponent
+                         : @"upload.txt";
+    NSError *readError = nil;
+    BOOL didStartAccessing = [fileURL startAccessingSecurityScopedResource];
+    NSData *data = [NSData dataWithContentsOfURL:fileURL options:0 error:&readError];
+    if (didStartAccessing) {
+        [fileURL stopAccessingSecurityScopedResource];
+    }
+
+    NSString *content =
+        [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (content == nil) {
+        content = [[NSString alloc] initWithData:data
+                                         encoding:NSISOLatin1StringEncoding];
+    }
+    if (content == nil) {
+        content = @"";
+    }
+
+    NSError *jsonError = nil;
+    NSData *nameJSON = [NSJSONSerialization dataWithJSONObject:name
+                                                       options:0
+                                                         error:&jsonError];
+    NSData *contentJSON = [NSJSONSerialization dataWithJSONObject:content
+                                                          options:0
+                                                            error:&jsonError];
+    if (nameJSON == nil || contentJSON == nil) {
+        return;
+    }
+
+    NSString *script = [NSString stringWithFormat:@"window.__cfdataHandlePickedFile(%@,%@);",
+                                                  [[NSString alloc] initWithData:nameJSON
+                                                                         encoding:NSUTF8StringEncoding],
+                                                  [[NSString alloc] initWithData:contentJSON
+                                                                         encoding:NSUTF8StringEncoding]];
+    [self.webView evaluateJavaScript:script completionHandler:nil];
 }
 
 - (void)saveTextFileNamed:(NSString *)fileName content:(NSString *)content {
@@ -434,48 +508,22 @@ static const int kBackendPort = 13335;
     return name.length > 0 ? name : @"cfdata-results.txt";
 }
 
-#pragma mark - WKUIDelegate
-
-- (void)webView:(WKWebView *)webView
-    runOpenPanelWithParameters:(WKOpenPanelParameters *)parameters
-              initiatedByFrame:(WKFrameInfo *)frame
-             completionHandler:
-                 (void (^)(NSArray<NSURL *> *_Nullable))completionHandler {
-    if (self.openPanelCompletion != nil) {
-        self.openPanelCompletion(nil);
-    }
-    self.openPanelCompletion = [completionHandler copy];
-
-    NSArray<UTType *> *contentTypes = parameters.allowedContentTypes;
-    if (contentTypes.count == 0) {
-        contentTypes = @[UTTypeText];
-    }
-
-    UIDocumentPickerViewController *picker =
-        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes
-                                                                   asCopy:YES];
-    picker.allowsMultipleSelection = parameters.allowsMultipleSelection;
-    picker.delegate = self;
-    [self presentViewController:picker animated:YES completion:nil];
-}
-
 #pragma mark - UIDocumentPickerDelegate
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
     didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    if (self.openPanelCompletion != nil) {
-        self.openPanelCompletion(urls);
-        self.openPanelCompletion = nil;
+    if (self.importPickerActive) {
+        self.importPickerActive = NO;
+        if (urls.count > 0) {
+            [self handlePickedFileAtURL:urls.firstObject];
+        }
     } else {
         [self cleanupPendingExport];
     }
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    if (self.openPanelCompletion != nil) {
-        self.openPanelCompletion(nil);
-        self.openPanelCompletion = nil;
-    }
+    self.importPickerActive = NO;
     [self cleanupPendingExport];
 }
 
