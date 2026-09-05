@@ -19,7 +19,7 @@
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
-static NSString *const kDiagnosticVersion = @"1.0.8";
+static NSString *const kDiagnosticVersion = @"1.0.9";
 static NSString *const kLiveLogFileName = @"cfdata-live.log";
 static NSString *const kLastLogFileName = @"cfdata-last.log";
 static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
@@ -97,6 +97,11 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, strong) UIView *loadingOverlay;
+@property (nonatomic, strong) UIView *diagnosticBar;
+@property (nonatomic, strong) UILabel *diagnosticBarStatusLabel;
+@property (nonatomic, strong) UIButton *diagnosticBarCopyButton;
+@property (nonatomic, strong) UIButton *diagnosticBarExportButton;
+@property (nonatomic, strong) UIButton *diagnosticBarRetryButton;
 @property (nonatomic, strong) UILabel *loadingTitle;
 @property (nonatomic, strong) UILabel *loadingMessage;
 @property (nonatomic, strong) UILabel *loadingDiagnosticLabel;
@@ -118,6 +123,10 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 @property (nonatomic) BOOL pageContentReadySignalReceived;
 @property (nonatomic) BOOL webSocketWatchdogScheduled;
 @property (nonatomic) BOOL contentHealthMonitorScheduled;
+@property (nonatomic, strong) dispatch_source_t contentHealthMonitorTimer;
+@property (nonatomic) BOOL webSocketFallbackCheckScheduled;
+@property (nonatomic) NSUInteger healthyWithoutWebSocketProbeCount;
+@property (nonatomic) NSUInteger postHideReloadCount;
 @property (nonatomic) BOOL loadingOverlayHidden;
 @property (nonatomic) BOOL startupFailureOverlayVisible;
 @property (nonatomic) NSUInteger webViewProbeCount;
@@ -180,6 +189,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     self.pageContentReadySignalReceived = NO;
     self.webSocketWatchdogScheduled = NO;
     self.contentHealthMonitorScheduled = NO;
+    self.webSocketFallbackCheckScheduled = NO;
+    self.healthyWithoutWebSocketProbeCount = 0;
+    self.postHideReloadCount = 0;
     self.startupFailureOverlayVisible = NO;
     self.webViewProbeCount = 0;
     self.emptyContentProbeCount = 0;
@@ -198,6 +210,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     [self logEvent:@"info" source:@"app" detail:@"viewDidLoad"];
     [self configureWebView];
     [self configureLoadingOverlay];
+    [self configureDiagnosticBar];
     [self startLogPump];
     [self startBackend];
 }
@@ -383,7 +396,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 - (NSString *)buildLogSnapshotLocked {
     NSMutableString *snapshot = [NSMutableString string];
     [snapshot appendString:@"=== CFData iOS runtime log ===\n"];
-    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\npageContentReady=%@\noverlayHidden=%@\n\n",
+    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\npageContentReady=%@\noverlayHidden=%@\nwebSocketFallbackCheck=%@\nhealthyWithoutWSProbes=%lu\nwhiteScreenReloads=%lu\n\n",
      NSHomeDirectory(), NSTemporaryDirectory(),
      [self.logDirectories componentsJoinedByString:@"\n"],
      self.backendPID, self.backendExitStatus,
@@ -392,7 +405,10 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
      self.pageLoadedSignalReceived ? @"YES" : @"NO",
      self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
      self.pageContentReadySignalReceived ? @"YES" : @"NO",
-     self.loadingOverlayHidden ? @"YES" : @"NO"];
+     self.loadingOverlayHidden ? @"YES" : @"NO",
+     self.webSocketFallbackCheckScheduled ? @"YES" : @"NO",
+     (unsigned long)self.healthyWithoutWebSocketProbeCount,
+     (unsigned long)self.postHideReloadCount];
     @synchronized(self.runtimeLogLines) {
         [snapshot appendString:[self.runtimeLogLines componentsJoinedByString:@"\n"]];
     }
@@ -603,7 +619,8 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "heartbeatTicks++;"
             "report('heartbeat','tick='+heartbeatTicks+' readyState='+"
             "document.readyState+' webSocketState='+"
-            "window.__cfdataIOSWebSocketState);"
+            "window.__cfdataIOSWebSocketState+' wsReadyState='+"
+            "window.__cfdataIOSWebSocketReadyState);"
             "},1000);}catch(error){report('error',safeSummary('heartbeat_failed',error));}"
             "stage('script_end');"
             "})();";
@@ -688,12 +705,138 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     ]];
 }
 
+- (void)configureDiagnosticBar {
+    self.diagnosticBar = [[UIView alloc] initWithFrame:CGRectZero];
+    self.diagnosticBar.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.diagnosticBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.diagnosticBar];
+
+    self.diagnosticBarStatusLabel = [[UILabel alloc] init];
+    self.diagnosticBarStatusLabel.text =
+        [NSString stringWithFormat:@"CFData %@ | 启动诊断", kDiagnosticVersion];
+    self.diagnosticBarStatusLabel.font = [UIFont systemFontOfSize:11];
+    self.diagnosticBarStatusLabel.textColor = [UIColor secondaryLabelColor];
+    self.diagnosticBarStatusLabel.numberOfLines = 1;
+    self.diagnosticBarStatusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.diagnosticBarStatusLabel
+        setContentCompressionResistancePriority:UILayoutPriorityDefaultLow
+                                       forAxis:UILayoutConstraintAxisHorizontal];
+    [self.diagnosticBarStatusLabel
+        setContentHuggingPriority:UILayoutPriorityDefaultLow
+                          forAxis:UILayoutConstraintAxisHorizontal];
+
+    self.diagnosticBarCopyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.diagnosticBarCopyButton setTitle:@"复制日志" forState:UIControlStateNormal];
+    [self.diagnosticBarCopyButton addTarget:self
+                                      action:@selector(copyDiagnostics:)
+                            forControlEvents:UIControlEventTouchUpInside];
+
+    self.diagnosticBarExportButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.diagnosticBarExportButton setTitle:@"导出日志" forState:UIControlStateNormal];
+    [self.diagnosticBarExportButton addTarget:self
+                                       action:@selector(exportDiagnostics:)
+                             forControlEvents:UIControlEventTouchUpInside];
+
+    self.diagnosticBarRetryButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.diagnosticBarRetryButton setTitle:@"重试" forState:UIControlStateNormal];
+    [self.diagnosticBarRetryButton addTarget:self
+                                      action:@selector(retryStartup:)
+                            forControlEvents:UIControlEventTouchUpInside];
+
+    NSArray<UIButton *> *buttons = @[
+        self.diagnosticBarCopyButton,
+        self.diagnosticBarExportButton,
+        self.diagnosticBarRetryButton
+    ];
+    for (UIButton *button in buttons) {
+        button.titleLabel.font = [UIFont systemFontOfSize:12];
+        button.contentEdgeInsets = UIEdgeInsetsMake(6, 7, 6, 7);
+        [button setContentHuggingPriority:UILayoutPriorityRequired
+                                  forAxis:UILayoutConstraintAxisHorizontal];
+        [button setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                                forAxis:UILayoutConstraintAxisHorizontal];
+    }
+
+    UIStackView *actionStack =
+        [[UIStackView alloc] initWithArrangedSubviews:buttons];
+    actionStack.axis = UILayoutConstraintAxisHorizontal;
+    actionStack.alignment = UIStackViewAlignmentCenter;
+    actionStack.distribution = UIStackViewDistributionFill;
+    actionStack.spacing = 6;
+    actionStack.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIStackView *barStack =
+        [[UIStackView alloc] initWithArrangedSubviews:@[
+            self.diagnosticBarStatusLabel,
+            actionStack
+        ]];
+    barStack.axis = UILayoutConstraintAxisHorizontal;
+    barStack.alignment = UIStackViewAlignmentCenter;
+    barStack.distribution = UIStackViewDistributionFill;
+    barStack.spacing = 8;
+    barStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.diagnosticBar addSubview:barStack];
+
+    UILayoutGuide *safeArea = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [self.diagnosticBar.leadingAnchor
+            constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.diagnosticBar.trailingAnchor
+            constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.diagnosticBar.topAnchor constraintEqualToAnchor:safeArea.topAnchor],
+        [self.diagnosticBar.heightAnchor constraintEqualToConstant:46],
+        [barStack.leadingAnchor
+            constraintEqualToAnchor:self.diagnosticBar.leadingAnchor
+                           constant:10],
+        [barStack.trailingAnchor
+            constraintEqualToAnchor:self.diagnosticBar.trailingAnchor
+                           constant:-10],
+        [barStack.centerYAnchor
+            constraintEqualToAnchor:self.diagnosticBar.centerYAnchor],
+    ]];
+
+    for (NSLayoutConstraint *constraint in self.view.constraints) {
+        BOOL isWebViewTop =
+            (constraint.firstItem == self.webView &&
+             constraint.firstAttribute == NSLayoutAttributeTop) ||
+            (constraint.secondItem == self.webView &&
+             constraint.secondAttribute == NSLayoutAttributeTop);
+        if (isWebViewTop) {
+            constraint.active = NO;
+        }
+    }
+    [NSLayoutConstraint activateConstraints:@[
+        [self.webView.topAnchor
+            constraintEqualToAnchor:self.diagnosticBar.bottomAnchor],
+    ]];
+}
+
+- (void)updateDiagnosticBarStatus:(NSString *)status {
+    if (status.length == 0) {
+        status = @"诊断状态未知";
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.diagnosticBarStatusLabel != nil) {
+            self.diagnosticBarStatusLabel.text = status;
+        }
+    });
+}
+
 - (void)startBackend {
     [self logEvent:@"info" source:@"app" detail:@"startBackend requested"];
     [self stopBackend];
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.contentHealthMonitorTimer != nil) {
+            dispatch_source_cancel(self.contentHealthMonitorTimer);
+            self.contentHealthMonitorTimer = nil;
+        }
         self.loadingOverlayHidden = NO;
+        self.loadingOverlay.hidden = NO;
+        self.loadingOverlay.alpha = 1;
         self.webSocketWatchdogScheduled = NO;
+        self.webSocketFallbackCheckScheduled = NO;
+        self.healthyWithoutWebSocketProbeCount = 0;
+        self.postHideReloadCount = 0;
         self.webViewProbeCount = 0;
         self.emptyContentProbeCount = 0;
         self.pageLoadedSignalReceived = NO;
@@ -709,6 +852,8 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         self.loadingTitle.textColor = [UIColor labelColor];
         self.loadingSpinner.hidden = NO;
         [self.loadingSpinner startAnimating];
+        [self updateDiagnosticBarStatus:
+            [NSString stringWithFormat:@"CFData %@ | 正在重新启动", kDiagnosticVersion]];
     });
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -1155,6 +1300,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         [self.loadingSpinner stopAnimating];
         self.loadingSpinner.hidden = YES;
         self.loadingRetryButton.hidden = NO;
+        [self updateDiagnosticBarStatus:
+            [NSString stringWithFormat:@"CFData %@ | %@ | 日志入口可用",
+                                       kDiagnosticVersion, title ?: @"错误"]];
     });
 }
 
@@ -1258,7 +1406,14 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     }
     self.loadingOverlayHidden = YES;
     self.startupFailureOverlayVisible = NO;
+    self.webSocketFallbackCheckScheduled = NO;
     [self logEvent:@"info" source:@"ui" detail:@"native loading overlay hidden"];
+    [self updateDiagnosticBarStatus:
+        [NSString stringWithFormat:@"CFData %@ | 界面已显示 | %@",
+                                   kDiagnosticVersion,
+                                   self.webSocketOpenedSignalReceived
+                                       ? @"WebSocket 已确认"
+                                       : @"WebSocket 兼容启动"]];
     [UIView animateWithDuration:0.18 animations:^{
         self.loadingOverlay.alpha = 0;
     } completion:^(BOOL finished) {
@@ -1295,6 +1450,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "var containerRect=container?container.getBoundingClientRect():null;"
             "var wsState=window.__cfdataIOSWebSocketState||'none';"
             "var wsReadyState='missing';"
+            "try{if(typeof window.__cfdataIOSWebSocketReadyState==='number'){"
+            "wsReadyState=String(window.__cfdataIOSWebSocketReadyState);}}"
+            "catch(e){wsReadyState='error';}"
             "try{if(typeof ws!=='undefined'&&ws&&typeof ws.readyState==='number'){"
             "wsReadyState=String(ws.readyState);}}catch(e){wsReadyState='error';}"
             "return JSON.stringify({"
@@ -1378,6 +1536,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                                     error:(NSError *)error
                                    reason:(NSString *)reason
                  allowHideWithoutWebSocket:(BOOL)allowHideWithoutWebSocket {
+    (void)allowHideWithoutWebSocket;
     NSString *raw = [result isKindOfClass:[NSString class]]
         ? (NSString *)result
         : @"none";
@@ -1406,6 +1565,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                  source:@"websocket_fallback"
                  detail:@"readyState probe observed OPEN"];
         [self updateLoadingMessage:@"WebSocket 已就绪，正在确认界面内容..."];
+        [self updateDiagnosticBarStatus:
+            [NSString stringWithFormat:@"CFData %@ | WebSocket 已就绪",
+                                       kDiagnosticVersion]];
     }
 
     NSString *loggedRaw = raw;
@@ -1434,16 +1596,45 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         self.pageContentReadySignalReceived = YES;
         self.emptyContentProbeCount = 0;
         if (!self.loadingOverlayHidden) {
-            BOOL canHide = self.webSocketOpenedSignalReceived ||
-                           (allowHideWithoutWebSocket &&
-                            [readyState isEqualToString:@"complete"]);
-            [self updateLoadingMessage:canHide
-                                        ? @"界面内容已就绪，正在完成启动..."
-                                        : @"界面内容已就绪，正在连接后端..."];
-            if (canHide) {
+            if (self.webSocketOpenedSignalReceived) {
+                [self updateLoadingMessage:@"界面内容已就绪，正在完成启动..."];
                 [self hideLoadingOverlay];
+                return;
             }
+
+            if ([readyState isEqualToString:@"complete"]) {
+                self.healthyWithoutWebSocketProbeCount += 1;
+                if (self.healthyWithoutWebSocketProbeCount >= 2) {
+                    [self logEvent:@"warning"
+                             source:@"content_health"
+                             detail:@"healthy page verified twice without WebSocket signal; using compatible startup fallback"];
+                    [self updateLoadingMessage:
+                        @"界面内容稳定，正在完成兼容启动..."];
+                    [self updateDiagnosticBarStatus:
+                        [NSString stringWithFormat:
+                            @"CFData %@ | 页面稳定 | WebSocket 兼容启动",
+                            kDiagnosticVersion]];
+                    [self hideLoadingOverlay];
+                    return;
+                }
+
+                [self updateLoadingMessage:
+                    @"界面内容已就绪，等待 WebSocket 确认..."];
+                [self updateDiagnosticBarStatus:
+                    [NSString stringWithFormat:
+                        @"CFData %@ | 页面正常 | 等待 WebSocket 确认",
+                        kDiagnosticVersion]];
+                [self scheduleWebSocketFallbackCheck];
+                return;
+            }
+
+            self.healthyWithoutWebSocketProbeCount = 0;
+            [self updateLoadingMessage:@"界面正在渲染，正在等待完整加载..."];
+            return;
         }
+        [self updateDiagnosticBarStatus:
+            [NSString stringWithFormat:@"CFData %@ | 页面内容正常",
+                                       kDiagnosticVersion]];
         return;
     }
 
@@ -1452,11 +1643,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     BOOL pageIsComplete = [readyState isEqualToString:@"complete"];
 
     if (self.loadingOverlayHidden && self.emptyContentProbeCount >= 2) {
-        [self logEvent:@"error"
-                 source:@"content_health"
-                 detail:@"hidden page became empty on repeated probes"];
-        [self showStartupError:@"界面显示异常"
-                       message:@"页面内容已消失，请复制或导出诊断日志；之后可点击重试。"];
+        [self handleHiddenPageWhiteScreen:state reason:reason];
     } else if (!self.loadingOverlayHidden &&
                pageIsComplete &&
                self.emptyContentProbeCount >= 2) {
@@ -1465,6 +1652,68 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     } else {
         [self updateLoadingMessage:@"页面正在渲染，正在检查可见内容..."];
     }
+}
+
+- (void)scheduleWebSocketFallbackCheck {
+    if (self.webSocketFallbackCheckScheduled || self.loadingOverlayHidden) {
+        return;
+    }
+    self.webSocketFallbackCheckScheduled = YES;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self == nil) {
+                           return;
+                       }
+                       self.webSocketFallbackCheckScheduled = NO;
+                       if (self.loadingOverlayHidden ||
+                           self.webSocketOpenedSignalReceived) {
+                           return;
+                       }
+                       [self evaluateWebViewContentHealth:@"websocket_fallback_check"
+                                 allowHideWithoutWebSocket:NO];
+                   });
+}
+
+- (void)handleHiddenPageWhiteScreen:(NSDictionary *)state
+                             reason:(NSString *)reason {
+    NSString *summary = state[@"probeError"];
+    if (summary.length == 0) {
+        summary = [NSString stringWithFormat:
+            @"readyState=%@ bodyTextLength=%@ visibleElements=%@",
+            state[@"readyState"] ?: @"missing",
+            state[@"bodyTextLength"] ?: @"missing",
+            state[@"visibleElementCount"] ?: @"missing"];
+    }
+    [self logEvent:@"error"
+             source:@"content_health"
+             detail:[NSString stringWithFormat:
+                                  @"hidden page became empty reason=%@ state=%@",
+                                  reason ?: @"unknown", summary]];
+
+    if (self.postHideReloadCount == 0) {
+        self.postHideReloadCount = 1;
+        self.emptyContentProbeCount = 0;
+        self.healthyWithoutWebSocketProbeCount = 0;
+        self.pageLoadedSignalReceived = NO;
+        self.webSocketOpenedSignalReceived = NO;
+        self.pageContentReadySignalReceived = NO;
+        self.bridgeInjected = NO;
+        [self updateDiagnosticBarStatus:
+            [NSString stringWithFormat:
+                @"CFData %@ | 检测到白屏 | 已自动刷新一次，日志入口保持可用",
+                kDiagnosticVersion]];
+        [self.webView reload];
+        return;
+    }
+
+    [self showStartupError:@"界面显示异常"
+                   message:@"页面白屏仍持续，诊断栏可继续复制或导出日志；点击重试可重新启动。"];
+    [self updateDiagnosticBarStatus:
+        [NSString stringWithFormat:
+            @"CFData %@ | 白屏未恢复 | 请复制诊断日志",
+            kDiagnosticVersion]];
 }
 
 - (void)evaluateWebViewContentHealth:(NSString *)reason
@@ -1488,21 +1737,29 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         return;
     }
     self.contentHealthMonitorScheduled = YES;
-    NSArray<NSNumber *> *delays = @[@1.0, @2.0, @3.0, @5.0];
-    for (NSNumber *delay in delays) {
-        int64_t nanoseconds = (int64_t)(delay.doubleValue * NSEC_PER_SEC);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, nanoseconds),
-                       dispatch_get_main_queue(), ^{
-                           if (!self.loadingOverlayHidden) {
-                               return;
-                           }
-                           NSString *reason =
-                               [NSString stringWithFormat:@"post_hide_%@s",
-                                                          delay.stringValue];
-                           [self evaluateWebViewContentHealth:reason
-                                     allowHideWithoutWebSocket:YES];
-                       });
-    }
+    __block NSUInteger tick = 0;
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_t timer =
+        dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                               dispatch_get_main_queue());
+    self.contentHealthMonitorTimer = timer;
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                              2 * NSEC_PER_SEC,
+                              250 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (self == nil || !self.loadingOverlayHidden) {
+            return;
+        }
+        tick += 1;
+        NSString *reason =
+            [NSString stringWithFormat:@"post_hide_monitor_%lu",
+                                       (unsigned long)tick];
+        [self evaluateWebViewContentHealth:reason
+                  allowHideWithoutWebSocket:YES];
+    });
+    dispatch_resume(timer);
 }
 
 #pragma mark - WKNavigationDelegate
@@ -1613,7 +1870,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     [self updateLoadingMessage:@"页面载入完成，正在检查界面内容..."];
     self.pageLoadedSignalReceived = YES;
     [self evaluateWebViewContentHealth:@"did_finish"
-             allowHideWithoutWebSocket:YES];
+             allowHideWithoutWebSocket:NO];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1662,18 +1919,30 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             if ([detail hasPrefix:@"open"] || [detail hasPrefix:@"message"]) {
                 self.webSocketOpenedSignalReceived = YES;
                 [self updateLoadingMessage:@"WebSocket 已连接，正在确认界面内容..."];
+                [self updateDiagnosticBarStatus:
+                    [NSString stringWithFormat:@"CFData %@ | WebSocket 已连接",
+                                               kDiagnosticVersion]];
                 [self evaluateWebViewContentHealth:@"websocket_open"
                          allowHideWithoutWebSocket:NO];
             } else if ([detail hasPrefix:@"create"]) {
                 [self updateLoadingMessage:@"WebSocket 正在创建..."];
+                [self updateDiagnosticBarStatus:
+                    [NSString stringWithFormat:@"CFData %@ | WebSocket 创建中",
+                                               kDiagnosticVersion]];
             } else if ([detail hasPrefix:@"close"] && self.loadingDiagnosticLabel != nil) {
                 self.loadingDiagnosticLabel.text =
                     [NSString stringWithFormat:@"版本 %@ | WebSocket 已关闭 | %@",
                                                kDiagnosticVersion, detail];
+                [self updateDiagnosticBarStatus:
+                    [NSString stringWithFormat:@"CFData %@ | WebSocket 已关闭",
+                                               kDiagnosticVersion]];
             } else if ([detail hasPrefix:@"error"] && self.loadingDiagnosticLabel != nil) {
                 self.loadingDiagnosticLabel.text =
                     [NSString stringWithFormat:@"版本 %@ | WebSocket 错误 | %@",
                                                kDiagnosticVersion, detail];
+                [self updateDiagnosticBarStatus:
+                    [NSString stringWithFormat:@"CFData %@ | WebSocket 错误",
+                                               kDiagnosticVersion]];
             }
             return;
         }
@@ -1884,6 +2153,10 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 }
 
 - (void)dealloc {
+    if (self.contentHealthMonitorTimer != nil) {
+        dispatch_source_cancel(self.contentHealthMonitorTimer);
+        self.contentHealthMonitorTimer = nil;
+    }
     [self stopLogPump];
     [self flushLogsToDocuments];
     [self stopBackend];

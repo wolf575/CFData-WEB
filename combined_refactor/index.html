@@ -2390,6 +2390,12 @@
         function reportIOSWebSocket(state, detail) {
             try {
                 window.__cfdataIOSWebSocketState = state;
+                try {
+                    window.__cfdataIOSWebSocketReadyState =
+                        typeof ws !== 'undefined' && ws
+                            ? ws.readyState
+                            : -1;
+                } catch (_) {}
                 if (window.webkit && window.webkit.messageHandlers &&
                     window.webkit.messageHandlers.cfdata) {
                     window.webkit.messageHandlers.cfdata.postMessage({
@@ -2448,6 +2454,7 @@
         }
 
         let ws;
+        let iosWebSocketPollTimer = null;
         let defaultSpeedTestUrl = "speed.okl.abrdns.com";
         let isTaskRunning = false;
         let isStoppingTask = false;
@@ -3078,10 +3085,27 @@
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsURL = wsProtocol + "//" + window.location.host + "/ws";
             window.__cfdataIOSWebSocketMessageSeen = false;
+            if (iosWebSocketPollTimer) {
+                window.clearInterval(iosWebSocketPollTimer);
+                iosWebSocketPollTimer = null;
+            }
             reportIOSWebSocket('connecting', wsURL);
             ws = new WebSocket(wsURL);
-            reportIOSWebSocket('create', wsURL);
+            reportIOSWebSocket('create',
+                wsURL + ' readyState=' + ws.readyState);
+            iosWebSocketPollTimer = window.setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    reportIOSWebSocket('open',
+                        'readyState_poll=' + ws.readyState);
+                    window.clearInterval(iosWebSocketPollTimer);
+                    iosWebSocketPollTimer = null;
+                }
+            }, 250);
             ws.onopen = () => {
+                if (iosWebSocketPollTimer) {
+                    window.clearInterval(iosWebSocketPollTimer);
+                    iosWebSocketPollTimer = null;
+                }
                 reportIOSWebSocket('open');
                 runIOSBootStep('ws_onopen', () => {
                     updateStatus('已连接服务器', true);
@@ -3101,7 +3125,8 @@
                     if (!window.__cfdataIOSWebSocketMessageSeen) {
                         window.__cfdataIOSWebSocketMessageSeen = true;
                         reportIOSWebSocket('message',
-                            'type=' + (msg && msg.type ? msg.type : 'unknown'));
+                            'type=' + (msg && msg.type ? msg.type : 'unknown') +
+                            ' readyState=' + ws.readyState);
                     }
                     handleMessage(msg);
                 } catch (e) {
@@ -3110,6 +3135,10 @@
                 }
             };
             ws.onclose = (event) => {
+                if (iosWebSocketPollTimer) {
+                    window.clearInterval(iosWebSocketPollTimer);
+                    iosWebSocketPollTimer = null;
+                }
                 reportIOSWebSocket('close',
                     'code=' + (event && event.code !== undefined ? event.code : -1) +
                     ' reason=' + (event && event.reason ? event.reason : ''));
