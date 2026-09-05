@@ -2357,6 +2357,82 @@
     </div>
 
     <script>
+        function reportIOSBootStage(step) {
+            try {
+                window.__cfdataIOSDiagnosticStage = 'page_' + step;
+                if (window.webkit && window.webkit.messageHandlers &&
+                    window.webkit.messageHandlers.cfdata) {
+                    window.webkit.messageHandlers.cfdata.postMessage({
+                        action: 'runtimeDiagnostic',
+                        kind: 'stage',
+                        detail: 'page_' + step
+                    });
+                }
+            } catch (_) {}
+        }
+
+        function reportIOSBootError(step, error) {
+            const detail = 'page_boot_' + step + ': ' +
+                String(error && error.message ? error.message : error);
+            try { window.__cfdataIOSPageBootError = detail; } catch (_) {}
+            try {
+                if (window.webkit && window.webkit.messageHandlers &&
+                    window.webkit.messageHandlers.cfdata) {
+                    window.webkit.messageHandlers.cfdata.postMessage({
+                        action: 'runtimeDiagnostic',
+                        kind: 'error',
+                        detail
+                    });
+                }
+            } catch (_) {}
+        }
+
+        function runIOSBootStep(name, fn) {
+            try {
+                reportIOSBootStage(name + '_start');
+                fn();
+                reportIOSBootStage(name + '_done');
+            } catch (error) {
+                reportIOSBootError(name, error);
+            }
+        }
+
+        function reportIOSContentState() {
+            let state = 'empty';
+            let visibleTextLength = 0;
+            let visibleElementCount = 0;
+            try {
+                const body = document.body;
+                if (body) {
+                    visibleTextLength = String(body.innerText || '')
+                        .replace(/\s+/g, '').length;
+                    visibleElementCount = body.children.length;
+                }
+                const documentReady =
+                    document.readyState === 'interactive' ||
+                    document.readyState === 'complete';
+                if (documentReady && visibleElementCount > 0 &&
+                    visibleTextLength >= 8) {
+                    state = 'ready';
+                }
+                window.__cfdataIOSContentState = state;
+                window.__cfdataIOSPageContentReady = state === 'ready';
+            } catch (_) {
+                state = 'error';
+            }
+            reportIOSBootStage('content_state_' + state);
+            try {
+                if (window.webkit && window.webkit.messageHandlers &&
+                    window.webkit.messageHandlers.cfdata) {
+                    window.webkit.messageHandlers.cfdata.postMessage({
+                        action: 'runtimeDiagnostic',
+                        kind: 'content_state',
+                        detail: state
+                    });
+                }
+            } catch (_) {}
+        }
+
         let ws;
         let defaultSpeedTestUrl = "speed.okl.abrdns.com";
         let isTaskRunning = false;
@@ -2988,9 +3064,13 @@
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
             ws.onopen = () => {
-                updateStatus('已连接服务器', true);
-                log('已连接服务器');
-                initThemeFromStorage();
+                runIOSBootStep('ws_onopen', () => {
+                    updateStatus('已连接服务器', true);
+                    log('已连接服务器');
+                    initThemeFromStorage();
+                });
+                window.__cfdataIOSWebSocketState = 'open';
+                reportIOSBootStage('ws_onopen_signal');
             };
             ws.onmessage = (event) => {
                 try {
@@ -6384,12 +6464,14 @@
         }
 
         window.addEventListener('DOMContentLoaded', () => {
-            connect();
-            initializeUI();
-            renderGitHubAccounts();
-            renderEdgetunnelAccounts();
-            switchMode('official');
-            initThemeFromStorage();
+            runIOSBootStep('connect', connect);
+            runIOSBootStep('initializeUI', initializeUI);
+            runIOSBootStep('renderGitHubAccounts', renderGitHubAccounts);
+            runIOSBootStep('renderEdgetunnelAccounts', renderEdgetunnelAccounts);
+            runIOSBootStep('switchMode', () => switchMode('official'));
+            runIOSBootStep('initTheme', initThemeFromStorage);
+            reportIOSBootStage('boot_sequence_done');
+            window.setTimeout(reportIOSContentState, 0);
         });
 
         function autoThemeBySystem() {
@@ -6398,7 +6480,12 @@
                 applyTheme('auto');
             }
         }
-        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', autoThemeBySystem);
+        const darkScheme = window.matchMedia('(prefers-color-scheme: dark)');
+        if (darkScheme && typeof darkScheme.addEventListener === 'function') {
+            darkScheme.addEventListener('change', autoThemeBySystem);
+        } else if (darkScheme && typeof darkScheme.addListener === 'function') {
+            darkScheme.addListener(autoThemeBySystem);
+        }
     </script>
 </body>
 

@@ -19,7 +19,7 @@
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
-static NSString *const kDiagnosticVersion = @"1.0.6";
+static NSString *const kDiagnosticVersion = @"1.0.7";
 static NSString *const kLiveLogFileName = @"cfdata-live.log";
 static NSString *const kLastLogFileName = @"cfdata-last.log";
 static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
@@ -115,9 +115,13 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 @property (nonatomic) BOOL bridgeInjected;
 @property (nonatomic) BOOL pageLoadedSignalReceived;
 @property (nonatomic) BOOL webSocketOpenedSignalReceived;
+@property (nonatomic) BOOL pageContentReadySignalReceived;
 @property (nonatomic) BOOL webSocketWatchdogScheduled;
+@property (nonatomic) BOOL contentHealthMonitorScheduled;
 @property (nonatomic) BOOL loadingOverlayHidden;
+@property (nonatomic) BOOL startupFailureOverlayVisible;
 @property (nonatomic) NSUInteger webViewProbeCount;
+@property (nonatomic) NSUInteger emptyContentProbeCount;
 @property (nonatomic, strong) NSMutableArray<NSString *> *runtimeLogLines;
 @property (nonatomic, strong) dispatch_queue_t logQueue;
 @property (nonatomic, strong) dispatch_source_t logTimer;
@@ -173,8 +177,12 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     self.backendExitDetail = @"none";
     self.pageLoadedSignalReceived = NO;
     self.webSocketOpenedSignalReceived = NO;
+    self.pageContentReadySignalReceived = NO;
     self.webSocketWatchdogScheduled = NO;
+    self.contentHealthMonitorScheduled = NO;
+    self.startupFailureOverlayVisible = NO;
     self.webViewProbeCount = 0;
+    self.emptyContentProbeCount = 0;
     self.runtimeLogLines = [NSMutableArray array];
     self.logQueue = dispatch_queue_create("com.cfdata.web.log", DISPATCH_QUEUE_SERIAL);
     self.logDateFormatter = [[NSDateFormatter alloc] init];
@@ -375,14 +383,16 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 - (NSString *)buildLogSnapshotLocked {
     NSMutableString *snapshot = [NSMutableString string];
     [snapshot appendString:@"=== CFData iOS runtime log ===\n"];
-    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\n\n",
+    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\npageContentReady=%@\noverlayHidden=%@\n\n",
      NSHomeDirectory(), NSTemporaryDirectory(),
      [self.logDirectories componentsJoinedByString:@"\n"],
      self.backendPID, self.backendExitStatus,
      self.backendExitObserved ? @"YES" : @"NO",
      self.backendExitDetail ?: @"none",
      self.pageLoadedSignalReceived ? @"YES" : @"NO",
-     self.webSocketOpenedSignalReceived ? @"YES" : @"NO"];
+     self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+     self.pageContentReadySignalReceived ? @"YES" : @"NO",
+     self.loadingOverlayHidden ? @"YES" : @"NO"];
     @synchronized(self.runtimeLogLines) {
         [snapshot appendString:[self.runtimeLogLines componentsJoinedByString:@"\n"]];
     }
@@ -715,11 +725,15 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         self.loadingOverlayHidden = NO;
         self.webSocketWatchdogScheduled = NO;
         self.webViewProbeCount = 0;
+        self.emptyContentProbeCount = 0;
         self.pageLoadedSignalReceived = NO;
         self.webSocketOpenedSignalReceived = NO;
+        self.pageContentReadySignalReceived = NO;
         self.backendExitObserved = NO;
         self.backendExitStatus = 0;
         self.backendExitDetail = @"none";
+        self.contentHealthMonitorScheduled = NO;
+        self.startupFailureOverlayVisible = NO;
         self.loadingRetryButton.hidden = YES;
         self.loadingTitle.text = @"CFData";
         self.loadingTitle.textColor = [UIColor labelColor];
@@ -1158,6 +1172,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             detail:[NSString stringWithFormat:@"title=%@ message=%@", title,
                                               message ?: @"none"]];
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.startupFailureOverlayVisible = YES;
         self.loadingOverlayHidden = NO;
         self.loadingOverlay.hidden = NO;
         self.loadingOverlay.alpha = 1;
@@ -1184,12 +1199,18 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     self.webSocketWatchdogScheduled = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (self.loadingOverlayHidden || self.webSocketOpenedSignalReceived) {
+        if (self.loadingOverlayHidden) {
             return;
         }
         NSString *state = self.pageLoadedSignalReceived
-            ? @"pageLoaded=YES webSocketOpen=NO"
-            : @"pageLoaded=NO webSocketOpen=NO";
+            ? [NSString stringWithFormat:
+                  @"pageLoaded=YES webSocketOpen=%@ contentReady=%@",
+                  self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+                  self.pageContentReadySignalReceived ? @"YES" : @"NO"]
+            : [NSString stringWithFormat:
+                  @"pageLoaded=NO webSocketOpen=%@ contentReady=%@",
+                  self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+                  self.pageContentReadySignalReceived ? @"YES" : @"NO"];
         [self logEvent:@"error" source:@"startup_watchdog"
                 detail:[NSString stringWithFormat:@"startup stuck for 15s; %@", state]];
         [self showStartupError:@"界面未完成连接"
@@ -1266,12 +1287,241 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         return;
     }
     self.loadingOverlayHidden = YES;
+    self.startupFailureOverlayVisible = NO;
     [self logEvent:@"info" source:@"ui" detail:@"native loading overlay hidden"];
     [UIView animateWithDuration:0.18 animations:^{
         self.loadingOverlay.alpha = 0;
     } completion:^(BOOL finished) {
-        self.loadingOverlay.hidden = YES;
+        if (!self.startupFailureOverlayVisible) {
+            self.loadingOverlay.hidden = YES;
+            [self schedulePostHideContentHealthChecks];
+        }
     }];
+}
+
+- (NSString *)webViewContentHealthScript {
+    return @"(function(){try{"
+            "var body=document.body||null;"
+            "var bodyText=body?String(body.innerText||''):'';"
+            "var elements=[];"
+            "try{if(body){elements=body.querySelectorAll('*');}}catch(e){}"
+            "var visibleElementCount=0;"
+            "var visibleTextLength=0;"
+            "for(var i=0;i<elements.length&&i<500;i++){"
+            "try{"
+            "var el=elements[i];"
+            "var style=window.getComputedStyle(el);"
+            "var rect=el.getBoundingClientRect();"
+            "if(style.display!=='none'&&style.visibility!=='hidden'&&"
+            "parseFloat(style.opacity||'1')>0&&rect.width>0&&rect.height>0){"
+            "visibleElementCount++;"
+            "var text=String(el.innerText||el.textContent||'').replace(/\\s+/g,'');"
+            "visibleTextLength+=text.length;"
+            "}"
+            "}catch(e){}"
+            "}"
+            "var container=null;"
+            "try{container=document.querySelector('.container');}catch(e){}"
+            "var containerRect=container?container.getBoundingClientRect():null;"
+            "var wsState=window.__cfdataIOSWebSocketState||'none';"
+            "var wsReadyState='missing';"
+            "try{if(typeof ws!=='undefined'&&ws&&typeof ws.readyState==='number'){"
+            "wsReadyState=String(ws.readyState);}}catch(e){wsReadyState='error';}"
+            "return JSON.stringify({"
+            "readyState:document.readyState,"
+            "title:document.title,"
+            "bodyChildren:body?body.children.length:-1,"
+            "bodyText:bodyText.slice(0,600),"
+            "bodyTextLength:bodyText.length,"
+            "bodyHTML:body?String(body.innerHTML||'').slice(0,600):'',"
+            "bodyWidth:body?body.getBoundingClientRect().width:-1,"
+            "bodyHeight:body?body.getBoundingClientRect().height:-1,"
+            "scrollHeight:document.documentElement.scrollHeight,"
+            "innerWidth:window.innerWidth,"
+            "innerHeight:window.innerHeight,"
+            "visibleElementCount:visibleElementCount,"
+            "visibleTextLength:visibleTextLength,"
+            "containerWidth:containerRect?containerRect.width:-1,"
+            "containerHeight:containerRect?containerRect.height:-1,"
+            "installed:!!window.__cfdataIOSDiagnosticsInstalled,"
+            "stage:window.__cfdataIOSDiagnosticStage||'',"
+            "webSocketState:wsState,"
+            "webSocketReadyState:wsReadyState,"
+            "pageBootError:window.__cfdataIOSPageBootError||''"
+            "});"
+            "}catch(error){"
+            "return JSON.stringify({probeError:String(error&&error.message?"
+            "error.message:error)});"
+            "}})()";
+}
+
+- (NSInteger)integerInState:(NSDictionary *)state
+                        key:(NSString *)key
+                  fallback:(NSInteger)fallback {
+    id value = state[key];
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)value integerValue];
+    }
+    if ([value isKindOfClass:[NSString class]]) {
+        return [(NSString *)value integerValue];
+    }
+    return fallback;
+}
+
+- (BOOL)webViewStateIndicatesHealthyContent:(NSDictionary *)state {
+    NSString *readyState = state[@"readyState"];
+    NSString *bodyText = state[@"bodyText"];
+    NSString *bodyHTML = state[@"bodyHTML"];
+    NSInteger bodyChildren = [self integerInState:state
+                                             key:@"bodyChildren"
+                                         fallback:-1];
+    NSInteger bodyTextLength = [self integerInState:state
+                                                key:@"bodyTextLength"
+                                            fallback:-1];
+    NSInteger visibleElementCount = [self integerInState:state
+                                                     key:@"visibleElementCount"
+                                                 fallback:-1];
+    NSInteger visibleTextLength = [self integerInState:state
+                                                   key:@"visibleTextLength"
+                                               fallback:-1];
+    double bodyWidth = [self integerInState:state key:@"bodyWidth" fallback:-1];
+    double bodyHeight = [self integerInState:state key:@"bodyHeight" fallback:-1];
+
+    BOOL pageIsLoaded =
+        [readyState isEqualToString:@"interactive"] ||
+        [readyState isEqualToString:@"complete"];
+    BOOL hasBodyContent =
+        bodyChildren > 0 &&
+        bodyTextLength >= 8 &&
+        [bodyText isKindOfClass:[NSString class]] &&
+        bodyText.length > 0 &&
+        [bodyHTML isKindOfClass:[NSString class]] &&
+        bodyHTML.length > 0;
+    BOOL hasVisibleContent =
+        visibleElementCount >= 3 && visibleTextLength >= 8;
+    BOOL hasUsableDimensions = bodyWidth > 1 && bodyHeight > 1;
+    return pageIsLoaded && hasBodyContent && hasVisibleContent &&
+           hasUsableDimensions;
+}
+
+- (void)processWebViewContentHealthResult:(id)result
+                                    error:(NSError *)error
+                                   reason:(NSString *)reason
+                 allowHideWithoutWebSocket:(BOOL)allowHideWithoutWebSocket {
+    NSString *raw = [result isKindOfClass:[NSString class]]
+        ? (NSString *)result
+        : @"none";
+    BOOL parsedOK = NO;
+    NSDictionary *state = nil;
+    if ([result isKindOfClass:[NSString class]]) {
+        NSData *jsonData = [(NSString *)result
+            dataUsingEncoding:NSUTF8StringEncoding];
+        if (jsonData != nil) {
+            id object = [NSJSONSerialization JSONObjectWithData:jsonData
+                                                        options:0
+                                                          error:nil];
+            if ([object isKindOfClass:[NSDictionary class]]) {
+                state = (NSDictionary *)object;
+                parsedOK = YES;
+            }
+        }
+    }
+
+    NSString *loggedRaw = raw;
+    if (loggedRaw.length > 1400) {
+        loggedRaw = [loggedRaw substringToIndex:1400];
+    }
+    [self logEvent:parsedOK ? @"info" : @"warning"
+             source:@"content_health"
+             detail:[NSString stringWithFormat:
+                                  @"reason=%@ raw=%@ error=%@",
+                                  reason ?: @"unknown",
+                                  loggedRaw ?: @"none",
+                                  error.localizedDescription ?: @"none"]];
+
+    if (!parsedOK) {
+        return;
+    }
+    if (self.startupFailureOverlayVisible) {
+        return;
+    }
+
+    NSString *readyState = state[@"readyState"];
+    BOOL healthy = [self webViewStateIndicatesHealthyContent:state];
+    if (healthy) {
+        self.pageLoadedSignalReceived = YES;
+        self.pageContentReadySignalReceived = YES;
+        self.emptyContentProbeCount = 0;
+        if (!self.loadingOverlayHidden) {
+            BOOL canHide = self.webSocketOpenedSignalReceived ||
+                           (allowHideWithoutWebSocket &&
+                            [readyState isEqualToString:@"complete"]);
+            [self updateLoadingMessage:canHide
+                                        ? @"界面内容已就绪，正在完成启动..."
+                                        : @"界面内容已就绪，正在连接后端..."];
+            if (canHide) {
+                [self hideLoadingOverlay];
+            }
+        }
+        return;
+    }
+
+    self.pageContentReadySignalReceived = NO;
+    self.emptyContentProbeCount += 1;
+    BOOL pageIsComplete = [readyState isEqualToString:@"complete"];
+
+    if (self.loadingOverlayHidden && self.emptyContentProbeCount >= 2) {
+        [self logEvent:@"error"
+                 source:@"content_health"
+                 detail:@"hidden page became empty on repeated probes"];
+        [self showStartupError:@"界面显示异常"
+                       message:@"页面内容已消失，请复制或导出诊断日志；之后可点击重试。"];
+    } else if (!self.loadingOverlayHidden &&
+               pageIsComplete &&
+               self.emptyContentProbeCount >= 2) {
+        [self showStartupError:@"页面内容为空"
+                       message:@"页面已加载，但未检测到可见内容；请复制或导出诊断日志，之后可点击重试。"];
+    } else {
+        [self updateLoadingMessage:@"页面正在渲染，正在检查可见内容..."];
+    }
+}
+
+- (void)evaluateWebViewContentHealth:(NSString *)reason
+            allowHideWithoutWebSocket:(BOOL)allowHideWithoutWebSocket {
+    __weak typeof(self) weakSelf = self;
+    [self.webView evaluateJavaScript:[self webViewContentHealthScript]
+                   completionHandler:^(id result, NSError *error) {
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self == nil) {
+                           return;
+                       }
+                       [self processWebViewContentHealthResult:result
+                                                        error:error
+                                                       reason:reason
+                                     allowHideWithoutWebSocket:allowHideWithoutWebSocket];
+                   }];
+}
+
+- (void)schedulePostHideContentHealthChecks {
+    if (self.contentHealthMonitorScheduled) {
+        return;
+    }
+    self.contentHealthMonitorScheduled = YES;
+    NSArray<NSNumber *> *delays = @[@1.0, @2.0, @3.0, @5.0];
+    for (NSNumber *delay in delays) {
+        int64_t nanoseconds = (int64_t)(delay.doubleValue * NSEC_PER_SEC);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, nanoseconds),
+                       dispatch_get_main_queue(), ^{
+                           if (!self.loadingOverlayHidden) {
+                               return;
+                           }
+                           NSString *reason =
+                               [NSString stringWithFormat:@"post_hide_%@s",
+                                                          delay.stringValue];
+                           [self evaluateWebViewContentHealth:reason
+                                     allowHideWithoutWebSocket:YES];
+                       });
+    }
 }
 
 #pragma mark - WKNavigationDelegate
@@ -1328,60 +1578,19 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         return;
     }
 
-    NSString *script =
-        @"JSON.stringify({readyState:document.readyState,title:document.title,"
-         "hasBody:!!document.body,bodyText:document.body?document.body.innerText.slice(0,120):'',"
-         "installed:!!window.__cfdataIOSDiagnosticsInstalled,"
-         "stage:window.__cfdataIOSDiagnosticStage||''})";
     __weak typeof(self) weakSelf = self;
-    [self.webView evaluateJavaScript:script
+    NSString *reason = [NSString stringWithFormat:@"runtime_tick_%lu",
+                                                  (unsigned long)probeNumber];
+    [self.webView evaluateJavaScript:[self webViewContentHealthScript]
                    completionHandler:^(id result, NSError *error) {
                        __strong typeof(weakSelf) self = weakSelf;
                        if (self == nil || self.loadingOverlayHidden) {
                            return;
                        }
-
-                       NSString *raw = [result isKindOfClass:[NSString class]]
-                           ? (NSString *)result
-                           : @"none";
-                       BOOL parsedOK = NO;
-                       NSDictionary *state = nil;
-                       if ([result isKindOfClass:[NSString class]]) {
-                           NSData *jsonData = [(NSString *)result
-                               dataUsingEncoding:NSUTF8StringEncoding];
-                           if (jsonData != nil) {
-                               id object = [NSJSONSerialization JSONObjectWithData:jsonData
-                                                                           options:0
-                                                                             error:nil];
-                               if ([object isKindOfClass:[NSDictionary class]]) {
-                                   state = (NSDictionary *)object;
-                                   parsedOK = YES;
-                               }
-                           }
-                       }
-
-                       NSString *readyState = state[@"readyState"];
-                       NSString *bodyText = state[@"bodyText"];
-                       BOOL pageIsInteractive =
-                           [readyState isEqualToString:@"interactive"] ||
-                           [readyState isEqualToString:@"complete"] ||
-                           ([bodyText isKindOfClass:[NSString class]] &&
-                            [bodyText containsString:@"Cloudflare IP Data"]);
-                       [self logEvent:parsedOK ? @"info" : @"warning"
-                               source:@"webview_probe"
-                               detail:[NSString stringWithFormat:
-                                                    @"tick=%lu raw=%@ error=%@ interactive=%@",
-                                                    (unsigned long)probeNumber,
-                                                    raw ?: @"none",
-                                                    error.localizedDescription ?: @"none",
-                                                    pageIsInteractive ? @"YES" : @"NO"]];
-
-                       if (pageIsInteractive) {
-                           self.pageLoadedSignalReceived = YES;
-                           [self updateLoadingMessage:@"页面已载入，正在连接后端..."];
-                           [self hideLoadingOverlay];
-                           return;
-                       }
+                       [self processWebViewContentHealthResult:result
+                                                        error:error
+                                                       reason:reason
+                                     allowHideWithoutWebSocket:NO];
                    }];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
@@ -1420,9 +1629,10 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                                                  result ?: @"none",
                                                  error.localizedDescription ?: @"none"]];
                    }];
-    [self updateLoadingMessage:@"页面已载入，正在等待界面连接..."];
+    [self updateLoadingMessage:@"页面载入完成，正在检查界面内容..."];
     self.pageLoadedSignalReceived = YES;
-    [self hideLoadingOverlay];
+    [self evaluateWebViewContentHealth:@"did_finish"
+             allowHideWithoutWebSocket:YES];
 }
 
 - (void)webView:(WKWebView *)webView
@@ -1470,7 +1680,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         if ([kind isEqualToString:@"websocket"]) {
             if ([detail hasPrefix:@"open"]) {
                 self.webSocketOpenedSignalReceived = YES;
-                [self hideLoadingOverlay];
+                [self updateLoadingMessage:@"WebSocket 已连接，正在确认界面内容..."];
+                [self evaluateWebViewContentHealth:@"websocket_open"
+                         allowHideWithoutWebSocket:NO];
             } else if ([detail hasPrefix:@"create"]) {
                 [self updateLoadingMessage:@"WebSocket 正在创建..."];
             } else if ([detail hasPrefix:@"close"] && self.loadingDiagnosticLabel != nil) {
@@ -1482,6 +1694,12 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                     [NSString stringWithFormat:@"版本 %@ | WebSocket 错误 | %@",
                                                kDiagnosticVersion, detail];
             }
+            return;
+        }
+
+        if ([kind isEqualToString:@"content_state"]) {
+            [self evaluateWebViewContentHealth:@"page_content_state"
+                     allowHideWithoutWebSocket:NO];
             return;
         }
 
@@ -1503,7 +1721,6 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         if ([kind isEqualToString:@"lifecycle"] && [detail hasPrefix:@"dom_content_loaded"]) {
             self.pageLoadedSignalReceived = YES;
             [self updateLoadingMessage:@"页面已载入，正在连接后端..."];
-            [self hideLoadingOverlay];
         }
 
         if (isError && self.loadingDiagnosticLabel != nil) {
