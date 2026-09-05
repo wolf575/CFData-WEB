@@ -19,7 +19,7 @@
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
-static NSString *const kDiagnosticVersion = @"1.0.7";
+static NSString *const kDiagnosticVersion = @"1.0.8";
 static NSString *const kLiveLogFileName = @"cfdata-live.log";
 static NSString *const kLastLogFileName = @"cfdata-last.log";
 static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
@@ -594,46 +594,16 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "stage('window_load');"
             "report('lifecycle','window_load');"
             "});"
-            "var NativeWebSocket=null;"
-            "try{NativeWebSocket=window.WebSocket;}catch(error){"
-            "report('error',safeSummary('websocket_capture_failed',error));}"
-            "if(NativeWebSocket){"
-            "try{"
-            "var WrappedWebSocket=function(url,protocols){"
-            "var socket;"
-            "try{socket=protocols?new NativeWebSocket(url,protocols):"
-            "new NativeWebSocket(url);}"
-            "catch(error){report('websocket',safeSummary('create_failed',error));"
-            "throw error;}"
-            "report('websocket','create '+url);"
-            "socket.addEventListener('open',function(){"
-            "window.__cfdataIOSWebSocketState='open';"
-            "report('websocket','open');"
-            "});"
-            "socket.addEventListener('close',function(event){"
-            "window.__cfdataIOSWebSocketState='closed';"
-            "report('websocket','close code='+(event&&event.code)+"
-            "' reason='+(event&&event.reason));"
-            "});"
-            "socket.addEventListener('error',function(){"
-            "window.__cfdataIOSWebSocketState='error';"
-            "report('websocket','error');"
-            "});"
-            "return socket;"
-            "};"
-            "WrappedWebSocket.prototype=NativeWebSocket.prototype;"
-            "WrappedWebSocket.CONNECTING=NativeWebSocket.CONNECTING;"
-            "WrappedWebSocket.OPEN=NativeWebSocket.OPEN;"
-            "WrappedWebSocket.CLOSING=NativeWebSocket.CLOSING;"
-            "WrappedWebSocket.CLOSED=NativeWebSocket.CLOSED;"
-            "window.WebSocket=WrappedWebSocket;"
-            "stage('websocket_wrapped');"
-            "}catch(error){report('error',safeSummary('websocket_wrap_failed',error));}"
-            "}"
+            "try{report('websocket','native constructor='+"
+            "(typeof window.WebSocket));}catch(error){"
+            "report('error',safeSummary('websocket_type_failed',error));}"
+            "stage('websocket_native');"
             "var heartbeatTicks=0;"
             "try{window.setInterval(function(){"
             "heartbeatTicks++;"
-            "report('heartbeat','tick='+heartbeatTicks+' readyState='+document.readyState);"
+            "report('heartbeat','tick='+heartbeatTicks+' readyState='+"
+            "document.readyState+' webSocketState='+"
+            "window.__cfdataIOSWebSocketState);"
             "},1000);}catch(error){report('error',safeSummary('heartbeat_failed',error));}"
             "stage('script_end');"
             "})();";
@@ -1333,6 +1303,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "bodyChildren:body?body.children.length:-1,"
             "bodyText:bodyText.slice(0,600),"
             "bodyTextLength:bodyText.length,"
+            "webSocketState:wsState,"
+            "webSocketReadyState:wsReadyState,"
+            "pageBootError:window.__cfdataIOSPageBootError||'',"
             "bodyHTML:body?String(body.innerHTML||'').slice(0,600):'',"
             "bodyWidth:body?body.getBoundingClientRect().width:-1,"
             "bodyHeight:body?body.getBoundingClientRect().height:-1,"
@@ -1344,10 +1317,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "containerWidth:containerRect?containerRect.width:-1,"
             "containerHeight:containerRect?containerRect.height:-1,"
             "installed:!!window.__cfdataIOSDiagnosticsInstalled,"
-            "stage:window.__cfdataIOSDiagnosticStage||'',"
-            "webSocketState:wsState,"
-            "webSocketReadyState:wsReadyState,"
-            "pageBootError:window.__cfdataIOSPageBootError||''"
+            "stage:window.__cfdataIOSDiagnosticStage||''"
             "});"
             "}catch(error){"
             "return JSON.stringify({probeError:String(error&&error.message?"
@@ -1425,6 +1395,17 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                 parsedOK = YES;
             }
         }
+    }
+
+    NSString *webSocketReadyState = state[@"webSocketReadyState"];
+    if (parsedOK &&
+        !self.webSocketOpenedSignalReceived &&
+        [webSocketReadyState isEqualToString:@"1"]) {
+        self.webSocketOpenedSignalReceived = YES;
+        [self logEvent:@"info"
+                 source:@"websocket_fallback"
+                 detail:@"readyState probe observed OPEN"];
+        [self updateLoadingMessage:@"WebSocket 已就绪，正在确认界面内容..."];
     }
 
     NSString *loggedRaw = raw;
@@ -1678,7 +1659,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if ([kind isEqualToString:@"websocket"]) {
-            if ([detail hasPrefix:@"open"]) {
+            if ([detail hasPrefix:@"open"] || [detail hasPrefix:@"message"]) {
                 self.webSocketOpenedSignalReceived = YES;
                 [self updateLoadingMessage:@"WebSocket 已连接，正在确认界面内容..."];
                 [self evaluateWebViewContentHealth:@"websocket_open"

@@ -2387,6 +2387,20 @@
             } catch (_) {}
         }
 
+        function reportIOSWebSocket(state, detail) {
+            try {
+                window.__cfdataIOSWebSocketState = state;
+                if (window.webkit && window.webkit.messageHandlers &&
+                    window.webkit.messageHandlers.cfdata) {
+                    window.webkit.messageHandlers.cfdata.postMessage({
+                        action: 'runtimeDiagnostic',
+                        kind: 'websocket',
+                        detail: state + (detail ? ' ' + detail : '')
+                    });
+                }
+            } catch (_) {}
+        }
+
         function runIOSBootStep(name, fn) {
             try {
                 reportIOSBootStage(name + '_start');
@@ -3062,8 +3076,13 @@
 
         function connect() {
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
+            const wsURL = wsProtocol + "//" + window.location.host + "/ws";
+            window.__cfdataIOSWebSocketMessageSeen = false;
+            reportIOSWebSocket('connecting', wsURL);
+            ws = new WebSocket(wsURL);
+            reportIOSWebSocket('create', wsURL);
             ws.onopen = () => {
+                reportIOSWebSocket('open');
                 runIOSBootStep('ws_onopen', () => {
                     updateStatus('已连接服务器', true);
                     log('已连接服务器');
@@ -3072,16 +3091,28 @@
                 window.__cfdataIOSWebSocketState = 'open';
                 reportIOSBootStage('ws_onopen_signal');
             };
+            ws.onerror = (event) => {
+                reportIOSWebSocket('error',
+                    event && event.message ? event.message : 'websocket_error');
+            };
             ws.onmessage = (event) => {
                 try {
                     const msg = JSON.parse(event.data);
+                    if (!window.__cfdataIOSWebSocketMessageSeen) {
+                        window.__cfdataIOSWebSocketMessageSeen = true;
+                        reportIOSWebSocket('message',
+                            'type=' + (msg && msg.type ? msg.type : 'unknown'));
+                    }
                     handleMessage(msg);
                 } catch (e) {
                     recordWebDebugError('ws_message_parse', e && e.message ? e.message : String(e));
                     console.error('WebSocket message parse error:', e);
                 }
             };
-            ws.onclose = () => {
+            ws.onclose = (event) => {
+                reportIOSWebSocket('close',
+                    'code=' + (event && event.code !== undefined ? event.code : -1) +
+                    ' reason=' + (event && event.reason ? event.reason : ''));
                 clearStopWatchdog();
                 resetCurrentSpeedButton();
                 if (backgroundTaskActive) {
