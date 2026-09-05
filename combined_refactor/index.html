@@ -2560,6 +2560,8 @@
 
         let ws;
         let iosWebSocketPollTimer = null;
+        let iosWebSocketConnectGeneration = 0;
+        let iosWebSocketConnectTimer = null;
         let defaultSpeedTestUrl = "speed.okl.abrdns.com";
         let isTaskRunning = false;
         let isStoppingTask = false;
@@ -3189,29 +3191,94 @@
         function connect() {
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsURL = wsProtocol + "//" + window.location.host + "/ws";
+            iosWebSocketConnectGeneration += 1;
+            const generation = iosWebSocketConnectGeneration;
+            const createdAt = Date.now();
             window.__cfdataIOSWebSocketMessageSeen = false;
             if (iosWebSocketPollTimer) {
                 window.clearInterval(iosWebSocketPollTimer);
                 iosWebSocketPollTimer = null;
             }
-            reportIOSWebSocket('connecting', wsURL);
-            ws = new WebSocket(wsURL);
+            if (iosWebSocketConnectTimer) {
+                window.clearTimeout(iosWebSocketConnectTimer);
+                iosWebSocketConnectTimer = null;
+            }
+            if (ws && (ws.readyState === WebSocket.CONNECTING ||
+                       ws.readyState === WebSocket.OPEN)) {
+                try {
+                    ws.onopen = null;
+                    ws.onerror = null;
+                    ws.onmessage = null;
+                    ws.onclose = null;
+                    ws.close();
+                } catch (_) {}
+            }
+            reportIOSWebSocket('connecting',
+                wsURL + ' generation=' + generation);
+            const socket = new WebSocket(wsURL);
+            ws = socket;
             reportIOSWebSocket('create',
-                wsURL + ' readyState=' + ws.readyState);
+                wsURL + ' readyState=' + socket.readyState +
+                ' generation=' + generation);
             iosWebSocketPollTimer = window.setInterval(() => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
+                if (generation !== iosWebSocketConnectGeneration ||
+                    socket !== ws) {
+                    return;
+                }
+                if (socket.readyState === WebSocket.OPEN) {
+                    const age = Date.now() - createdAt;
                     reportIOSWebSocket('open',
-                        'readyState_poll=' + ws.readyState);
+                        'readyState_poll=' + socket.readyState +
+                        ' age=' + age + 'ms generation=' + generation);
                     window.clearInterval(iosWebSocketPollTimer);
                     iosWebSocketPollTimer = null;
+                    if (iosWebSocketConnectTimer) {
+                        window.clearTimeout(iosWebSocketConnectTimer);
+                        iosWebSocketConnectTimer = null;
+                    }
+                } else {
+                    const age = Date.now() - createdAt;
+                    if (age >= 2500) {
+                        reportIOSWebSocket('watchdog_reconnect',
+                            'readyState=' + socket.readyState +
+                            ' age=' + age + 'ms generation=' + generation);
+                        window.clearInterval(iosWebSocketPollTimer);
+                        iosWebSocketPollTimer = null;
+                        try {
+                            socket.onopen = null;
+                            socket.onerror = null;
+                            socket.onmessage = null;
+                            socket.onclose = null;
+                            socket.close();
+                        } catch (_) {}
+                        if (generation === iosWebSocketConnectGeneration) {
+                            iosWebSocketConnectTimer = window.setTimeout(() => {
+                                iosWebSocketConnectTimer = null;
+                                if (generation === iosWebSocketConnectGeneration) {
+                                    connect();
+                                }
+                            }, 250);
+                        }
+                    }
                 }
             }, 250);
-            ws.onopen = () => {
+            socket.onopen = () => {
                 if (iosWebSocketPollTimer) {
                     window.clearInterval(iosWebSocketPollTimer);
                     iosWebSocketPollTimer = null;
                 }
-                reportIOSWebSocket('open');
+                if (iosWebSocketConnectTimer) {
+                    window.clearTimeout(iosWebSocketConnectTimer);
+                    iosWebSocketConnectTimer = null;
+                }
+                if (generation !== iosWebSocketConnectGeneration ||
+                    socket !== ws) {
+                    reportIOSWebSocket('stale_open',
+                        'socketGeneration=' + generation +
+                        ' currentGeneration=' + iosWebSocketConnectGeneration);
+                    return;
+                }
+                reportIOSWebSocket('open', 'generation=' + generation);
                 runIOSBootStep('ws_onopen', () => {
                     updateStatus('已连接服务器', true);
                     log('已连接服务器');
@@ -3220,18 +3287,32 @@
                 window.__cfdataIOSWebSocketState = 'open';
                 reportIOSBootStage('ws_onopen_signal');
             };
-            ws.onerror = (event) => {
+            socket.onerror = (event) => {
+                if (generation !== iosWebSocketConnectGeneration ||
+                    socket !== ws) {
+                    reportIOSWebSocket('stale_error',
+                        'socketGeneration=' + generation +
+                        ' currentGeneration=' + iosWebSocketConnectGeneration);
+                    return;
+                }
                 reportIOSWebSocket('error',
                     event && event.message ? event.message : 'websocket_error');
             };
-            ws.onmessage = (event) => {
+            socket.onmessage = (event) => {
+                if (generation !== iosWebSocketConnectGeneration ||
+                    socket !== ws) {
+                    reportIOSWebSocket('stale_message',
+                        'socketGeneration=' + generation +
+                        ' currentGeneration=' + iosWebSocketConnectGeneration);
+                    return;
+                }
                 try {
                     const msg = JSON.parse(event.data);
                     if (!window.__cfdataIOSWebSocketMessageSeen) {
                         window.__cfdataIOSWebSocketMessageSeen = true;
                         reportIOSWebSocket('message',
                             'type=' + (msg && msg.type ? msg.type : 'unknown') +
-                            ' readyState=' + ws.readyState);
+                            ' readyState=' + socket.readyState);
                     }
                     handleMessage(msg);
                 } catch (e) {
@@ -3239,14 +3320,22 @@
                     console.error('WebSocket message parse error:', e);
                 }
             };
-            ws.onclose = (event) => {
+            socket.onclose = (event) => {
                 if (iosWebSocketPollTimer) {
                     window.clearInterval(iosWebSocketPollTimer);
                     iosWebSocketPollTimer = null;
                 }
+                if (generation !== iosWebSocketConnectGeneration ||
+                    socket !== ws) {
+                    reportIOSWebSocket('stale_close',
+                        'socketGeneration=' + generation +
+                        ' currentGeneration=' + iosWebSocketConnectGeneration);
+                    return;
+                }
                 reportIOSWebSocket('close',
                     'code=' + (event && event.code !== undefined ? event.code : -1) +
-                    ' reason=' + (event && event.reason ? event.reason : ''));
+                    ' reason=' + (event && event.reason ? event.reason : '') +
+                    ' generation=' + generation);
                 clearStopWatchdog();
                 resetCurrentSpeedButton();
                 if (backgroundTaskActive) {
@@ -3256,7 +3345,12 @@
                 }
                 updateStatus('连接断开，3秒后重连...', false);
                 log('连接断开，正在重连...');
-                setTimeout(connect, 3000);
+                iosWebSocketConnectTimer = window.setTimeout(() => {
+                    iosWebSocketConnectTimer = null;
+                    if (generation === iosWebSocketConnectGeneration) {
+                        connect();
+                    }
+                }, 3000);
             };
         }
 

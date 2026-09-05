@@ -20,7 +20,7 @@
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
-static NSString *const kDiagnosticVersion = @"1.0.10";
+static NSString *const kDiagnosticVersion = @"1.0.11";
 static NSString *const kLiveLogFileName = @"cfdata-live.log";
 static NSString *const kLastLogFileName = @"cfdata-last.log";
 static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
@@ -134,6 +134,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 @property (nonatomic) NSUInteger emptyContentProbeCount;
 @property (nonatomic) BOOL startupSnapshotCaptured;
 @property (nonatomic, strong) NSString *lastStartupSnapshotPath;
+@property (nonatomic) NSUInteger startupGeneration;
 @property (nonatomic, strong) NSMutableArray<NSString *> *runtimeLogLines;
 @property (nonatomic, strong) dispatch_queue_t logQueue;
 @property (nonatomic, strong) dispatch_source_t logTimer;
@@ -200,6 +201,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     self.emptyContentProbeCount = 0;
     self.startupSnapshotCaptured = NO;
     self.lastStartupSnapshotPath = nil;
+    self.startupGeneration = 0;
     self.runtimeLogLines = [NSMutableArray array];
     self.logQueue = dispatch_queue_create("com.cfdata.web.log", DISPATCH_QUEUE_SERIAL);
     self.logDateFormatter = [[NSDateFormatter alloc] init];
@@ -864,6 +866,11 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
 - (void)startBackend {
     [self logEvent:@"info" source:@"app" detail:@"startBackend requested"];
+    NSUInteger startupGeneration = 0;
+    @synchronized(self) {
+        self.startupGeneration += 1;
+        startupGeneration = self.startupGeneration;
+    }
     [self stopBackend];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.contentHealthMonitorTimer != nil) {
@@ -967,11 +974,15 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             [self logEvent:@"info" source:@"webview"
                     detail:[NSString stringWithFormat:@"loading http://127.0.0.1:%d", kBackendPort]];
             [self updateLoadingMessage:@"正在加载界面..."];
-            NSURL *url =
-                [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d",
-                                                                  kBackendPort]];
+            NSURLComponents *components = [[NSURLComponents alloc] initWithString:
+                [NSString stringWithFormat:@"http://127.0.0.1:%d", kBackendPort]];
+            components.queryItems =
+                @[[NSURLQueryItem queryItemWithName:@"ios_boot"
+                                              value:[@(startupGeneration) stringValue]]];
+            NSURL *url = components.URL;
+            [self.webView stopLoading];
             [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
-            [self scheduleStartupWatchdog];
+            [self scheduleStartupWatchdogForGeneration:startupGeneration];
         });
     });
 }
@@ -1359,14 +1370,16 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     [self startBackend];
 }
 
-- (void)scheduleStartupWatchdog {
+- (void)scheduleStartupWatchdogForGeneration:(NSUInteger)generation {
     if (self.webSocketWatchdogScheduled) {
         return;
     }
     self.webSocketWatchdogScheduled = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (self.loadingOverlayHidden) {
+        if (self.loadingOverlayHidden ||
+            self.startupFailureOverlayVisible ||
+            self.startupGeneration != generation) {
             return;
         }
         NSString *state = self.pageLoadedSignalReceived
@@ -1687,15 +1700,20 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "return {left:Math.round(r.left),top:Math.round(r.top),"
             "width:Math.round(r.width),height:Math.round(r.height),"
             "right:Math.round(r.right),bottom:Math.round(r.bottom)};}"
-            "function textOf(el){try{return String(el.innerText||el.textContent||'');}"
+            "function safeText(value){try{return String(value||'');}"
             "catch(e){return '';}}"
+            "function safeSlice(value,max){try{"
+            "var chars=Array.from(String(value||''));"
+            "return chars.slice(0,max).join('');}"
+            "catch(e){return safeText(value).slice(0,max);}}"
+            "function textOf(el){return safeText(el?el.innerText||el.textContent:'');}"
             "function styleOf(el){if(!el||!window.getComputedStyle){return null;}"
             "var s=window.getComputedStyle(el);"
             "return {backgroundColor:s.backgroundColor||'',color:s.color||'',"
-            "backgroundImage:String(s.backgroundImage||'').slice(0,220),"
+            "backgroundImage:safeSlice(s.backgroundImage,220),"
             "opacity:s.opacity||'1',display:s.display||'',"
             "visibility:s.visibility||'',position:s.position||'',"
-            "transform:String(s.transform||'').slice(0,100),"
+            "transform:safeSlice(s.transform,100),"
             "zIndex:s.zIndex||'',overflow:s.overflow||'',"
             "pointerEvents:s.pointerEvents||''};}"
             "var body=document.body||null;"
@@ -1714,7 +1732,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "if(style.display!=='none'&&style.visibility!=='hidden'&&"
             "parseFloat(style.opacity||'1')>0&&rect&&rect.width>0&&rect.height>0){"
             "visibleElementCount++;"
-            "var text=String(el.innerText||el.textContent||'').replace(/\\s+/g,'');"
+            "var text=safeText(el.innerText||el.textContent||'').replace(/\\s+/g,'');"
             "visibleTextLength+=text.length;"
             "if(intersectsViewport(rect)){viewportVisibleElementCount++;"
             "viewportTextLength+=text.length;}"
@@ -1727,7 +1745,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "for(var j=0;j<keySelectors.length;j++){try{"
             "var keyEl=document.querySelector(keySelectors[j]);"
             "keyRects[keySelectors[j]]=keyEl"
-            "?{rect:rectOf(keyEl),style:styleOf(keyEl),text:textOf(keyEl).slice(0,100)}"
+            "?{rect:rectOf(keyEl),style:styleOf(keyEl),text:safeSlice(textOf(keyEl),100)}"
             ":null;}catch(e){}}"
             "var cx=Math.max(1,window.innerWidth*0.5);"
             "var points=[[cx,window.innerHeight*0.22],[cx,window.innerHeight*0.45],"
@@ -1739,8 +1757,8 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "Math.round(points[p][1]));"
             "if(hitEl){viewportHits.push({tag:hitEl.tagName||'',"
             "id:hitEl.id||'',"
-            "className:String(hitEl.className||'').slice(0,140),"
-            "text:textOf(hitEl).slice(0,100),rect:rectOf(hitEl),"
+            "className:safeSlice(hitEl.className,140),"
+            "text:safeSlice(textOf(hitEl),100),rect:rectOf(hitEl),"
             "style:styleOf(hitEl)});}}catch(e){}}"
             "var visualViewport=null;"
             "try{if(window.visualViewport){visualViewport={"
@@ -1759,9 +1777,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "return JSON.stringify({"
             "readyState:document.readyState,title:document.title,url:location.href,"
             "bodyChildren:body?body.children.length:-1,"
-            "bodyText:body?textOf(body).slice(0,600):'',"
+            "bodyText:body?safeSlice(textOf(body),600):'',"
             "bodyTextLength:body?textOf(body).length:-1,"
-            "bodyHTML:body?String(body.innerHTML||'').slice(0,600):'',"
+            "bodyHTML:body?safeSlice(body.innerHTML,600):'',"
             "bodyWidth:body?body.getBoundingClientRect().width:-1,"
             "bodyHeight:body?body.getBoundingClientRect().height:-1,"
             "scrollHeight:document.documentElement.scrollHeight,"
