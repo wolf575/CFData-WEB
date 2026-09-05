@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Cloudflare IP Data (Combined)</title>
     <link rel="icon" type="image/png" href="favicon.png">
     <style>
@@ -13,13 +13,13 @@
             --success-color: #10b981;
             --warning-color: #f59e0b;
             --error-color: #ef4444;
-            --bg-color: #eef1f5;
-            --card-bg: #fbfcfe;
-            --text-main: #243041;
-            --text-secondary: #64748b;
-            --border-color: #dbe2ea;
-            --radius: 16px;
-            --shadow: 0 18px 24px -8px rgba(30, 41, 59, .08), 0 8px 10px -8px rgba(30, 41, 59, .06), 0 0 0 1px rgba(30, 41, 59, .03);
+            --bg-color: #f3f4f6;
+            --card-bg: #ffffff;
+            --text-main: #1f2937;
+            --text-secondary: #6b7280;
+            --border-color: #e5e7eb;
+            --radius: 8px;
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
         }
 
         :root.dark-theme,
@@ -30,7 +30,7 @@
             --text-secondary: #94a3b8;
             --border-color: #334155;
             --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            background-color: #0f172a;
         }
 
         .no-transition,
@@ -73,12 +73,25 @@
             box-sizing: border-box;
         }
 
-        body {
-            margin: 0;
-            padding: 15px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background: linear-gradient(135deg, #eef2f6 0%, #e3e8ef 100%);
+        html {
+            min-height: 100%;
+            background-color: var(--bg-color);
             color: var(--text-main);
+        }
+
+        body {
+            min-height: 100%;
+            margin: 0;
+            padding: max(15px, env(safe-area-inset-top)) 15px 15px;
+            position: relative;
+            overflow-x: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            opacity: 1;
+            visibility: visible;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-text-size-adjust: 100%;
         }
 
         .container {
@@ -90,6 +103,9 @@
             padding: 20px;
             border: 1px solid rgba(148, 163, 184, 0.28);
             box-shadow: var(--shadow);
+            transform: none;
+            opacity: 1;
+            visibility: visible;
         }
 
         .top-actions {
@@ -1607,6 +1623,62 @@
         *:focus {
             outline: none;
         }
+
+        body.ios-startup-render-fallback {
+            display: block !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            transform: none !important;
+            background-color: #f3f4f6 !important;
+            color: #1f2937 !important;
+        }
+
+        body.ios-startup-render-fallback .container {
+            display: block !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            transform: none !important;
+            background-color: #ffffff !important;
+            color: #1f2937 !important;
+        }
+
+        @supports (-webkit-touch-callout: none) {
+            html {
+                background-color: #f3f4f6;
+            }
+
+            body {
+                background-color: #f3f4f6;
+                overflow-x: hidden;
+            }
+
+            .container {
+                transform: translateZ(0);
+                -webkit-transform: translateZ(0);
+                backface-visibility: hidden;
+                -webkit-backface-visibility: hidden;
+            }
+
+            .section-box,
+            .controls,
+            .mode-switch,
+            .tabs,
+            .tab,
+            .action-btn,
+            .menu-btn,
+            .danger-btn,
+            .settings-menu,
+            .result-modal {
+                border-radius: 8px;
+            }
+
+            button,
+            input,
+            select,
+            textarea {
+                border-radius: 6px;
+            }
+        }
     </style>
     <script>
     (function(){
@@ -2451,6 +2523,39 @@
                     });
                 }
             } catch (_) {}
+        }
+
+        function applyIOSRenderFallback() {
+            try {
+                if (!document.body) return;
+                document.body.classList.add('ios-startup-render-fallback');
+                document.body.style.visibility = 'visible';
+                document.body.style.opacity = '1';
+                document.body.style.transform = 'none';
+                window.scrollTo(0, 0);
+                if (document.documentElement) {
+                    document.documentElement.scrollTop = 0;
+                }
+                window.__cfdataIOSRenderFallbackApplied = true;
+                reportIOSBootStage('render_fallback');
+            } catch (error) {
+                reportIOSBootError('render_fallback', error);
+            }
+        }
+
+        function finalizeIOSRender() {
+            try {
+                if (!document.body) return;
+                document.body.classList.remove('ios-startup-render-fallback');
+                window.scrollTo(0, 0);
+                if (document.documentElement) {
+                    document.documentElement.scrollTop = 0;
+                }
+                window.__cfdataIOSRenderFinalized = true;
+                reportIOSBootStage('render_finalized');
+            } catch (error) {
+                reportIOSBootError('render_finalize', error);
+            }
         }
 
         let ws;
@@ -6524,6 +6629,7 @@
         }
 
         window.addEventListener('DOMContentLoaded', () => {
+            applyIOSRenderFallback();
             runIOSBootStep('connect', connect);
             runIOSBootStep('initializeUI', initializeUI);
             runIOSBootStep('renderGitHubAccounts', renderGitHubAccounts);
@@ -6532,6 +6638,12 @@
             runIOSBootStep('initTheme', initThemeFromStorage);
             reportIOSBootStage('boot_sequence_done');
             window.setTimeout(reportIOSContentState, 0);
+            window.setTimeout(finalizeIOSRender, 300);
+        });
+
+        window.addEventListener('load', () => {
+            applyIOSRenderFallback();
+            window.setTimeout(finalizeIOSRender, 50);
         });
 
         function autoThemeBySystem() {
