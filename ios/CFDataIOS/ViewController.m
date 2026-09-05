@@ -20,7 +20,7 @@
 
 static NSString *const kBackendBinaryName = @"cfdata";
 static NSString *const kBridgeMessageName = @"cfdata";
-static NSString *const kDiagnosticVersion = @"1.0.11";
+static NSString *const kDiagnosticVersion = @"1.0.13";
 static NSString *const kLiveLogFileName = @"cfdata-live.log";
 static NSString *const kLastLogFileName = @"cfdata-last.log";
 static NSString *const kSystemLogDirectory = @"/var/mobile/Documents/cfdata-logs";
@@ -135,6 +135,14 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 @property (nonatomic) BOOL startupSnapshotCaptured;
 @property (nonatomic, strong) NSString *lastStartupSnapshotPath;
 @property (nonatomic) NSUInteger startupGeneration;
+@property (nonatomic) NSUInteger webViewRuntimeGeneration;
+@property (nonatomic) BOOL webViewProbeInFlight;
+@property (nonatomic) NSUInteger webViewProbeRequestID;
+@property (nonatomic) BOOL webSocketStateProbeInFlight;
+@property (nonatomic) NSUInteger webSocketStateProbeRequestID;
+@property (nonatomic) NSUInteger webSocketStateProbeCount;
+@property (nonatomic, strong) NSString *lastWebSocketReadyState;
+@property (nonatomic) NSUInteger startupWatchdogDeferrals;
 @property (nonatomic, strong) NSMutableArray<NSString *> *runtimeLogLines;
 @property (nonatomic, strong) dispatch_queue_t logQueue;
 @property (nonatomic, strong) dispatch_source_t logTimer;
@@ -202,6 +210,14 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     self.startupSnapshotCaptured = NO;
     self.lastStartupSnapshotPath = nil;
     self.startupGeneration = 0;
+    self.webViewRuntimeGeneration = 0;
+    self.webViewProbeInFlight = NO;
+    self.webViewProbeRequestID = 0;
+    self.webSocketStateProbeInFlight = NO;
+    self.webSocketStateProbeRequestID = 0;
+    self.webSocketStateProbeCount = 0;
+    self.lastWebSocketReadyState = @"missing";
+    self.startupWatchdogDeferrals = 0;
     self.runtimeLogLines = [NSMutableArray array];
     self.logQueue = dispatch_queue_create("com.cfdata.web.log", DISPATCH_QUEUE_SERIAL);
     self.logDateFormatter = [[NSDateFormatter alloc] init];
@@ -421,7 +437,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 - (NSString *)buildLogSnapshotLocked {
     NSMutableString *snapshot = [NSMutableString string];
     [snapshot appendString:@"=== CFData iOS runtime log ===\n"];
-    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\npageContentReady=%@\noverlayHidden=%@\nwebSocketFallbackCheck=%@\nhealthyWithoutWSProbes=%lu\nwhiteScreenReloads=%lu\nwebViewFrame=%@\nwebViewHidden=%@\nwebViewAlpha=%@\nwebViewOpaque=%@\nwebViewInteractions=%@\nloadingOverlayFrame=%@\nloadingOverlayHidden=%@\ndiagnosticBarFrame=%@\nwindowVisible=%@\nlastStartupSnapshotPath=%@\n\n",
+    [snapshot appendFormat:@"home=%@\ntemp=%@\nlogDirectories=%@\nbackendPID=%d\nexitStatus=%d\nexitObserved=%@\nexitDetail=%@\npageLoaded=%@\nwebSocketOpened=%@\npageContentReady=%@\noverlayHidden=%@\nwebSocketFallbackCheck=%@\nhealthyWithoutWSProbes=%lu\nwhiteScreenReloads=%lu\nwebViewFrame=%@\nwebViewHidden=%@\nwebViewAlpha=%@\nwebViewOpaque=%@\nwebViewInteractions=%@\nloadingOverlayFrame=%@\nloadingOverlayHidden=%@\ndiagnosticBarFrame=%@\nwindowVisible=%@\nlastWebSocketReadyState=%@\nwebSocketStateProbeCount=%lu\nwebViewProbeRequestID=%lu\nwebViewProbeInFlight=%@\nstartupWatchdogDeferrals=%lu\nlastStartupSnapshotPath=%@\n\n",
      NSHomeDirectory(), NSTemporaryDirectory(),
      [self.logDirectories componentsJoinedByString:@"\n"],
      self.backendPID, self.backendExitStatus,
@@ -443,6 +459,11 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
      self.loadingOverlay.hidden ? @"YES" : @"NO",
      NSStringFromCGRect(self.diagnosticBar.frame),
      self.view.window != nil ? @"YES" : @"NO",
+     self.lastWebSocketReadyState ?: @"missing",
+     (unsigned long)self.webSocketStateProbeCount,
+     (unsigned long)self.webViewProbeRequestID,
+     self.webViewProbeInFlight ? @"YES" : @"NO",
+     (unsigned long)self.startupWatchdogDeferrals,
      self.lastStartupSnapshotPath ?: @"none"];
     @synchronized(self.runtimeLogLines) {
         [snapshot appendString:[self.runtimeLogLines componentsJoinedByString:@"\n"]];
@@ -889,6 +910,14 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         self.emptyContentProbeCount = 0;
         self.startupSnapshotCaptured = NO;
         self.lastStartupSnapshotPath = nil;
+        self.webViewRuntimeGeneration += 1;
+        self.webViewProbeInFlight = NO;
+        self.webViewProbeRequestID += 1;
+        self.webSocketStateProbeInFlight = NO;
+        self.webSocketStateProbeRequestID += 1;
+        self.webSocketStateProbeCount = 0;
+        self.lastWebSocketReadyState = @"missing";
+        self.startupWatchdogDeferrals = 0;
         self.pageLoadedSignalReceived = NO;
         self.webSocketOpenedSignalReceived = NO;
         self.pageContentReadySignalReceived = NO;
@@ -1359,6 +1388,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         [self.loadingSpinner stopAnimating];
         self.loadingSpinner.hidden = YES;
         self.loadingRetryButton.hidden = NO;
+        self.diagnosticBar.hidden = NO;
+        self.diagnosticBar.alpha = 1;
+        self.diagnosticBar.userInteractionEnabled = YES;
         [self.view bringSubviewToFront:self.diagnosticBar];
         [self updateDiagnosticBarStatus:
             [NSString stringWithFormat:@"CFData %@ | %@ | 日志入口可用",
@@ -1375,24 +1407,71 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         return;
     }
     self.webSocketWatchdogScheduled = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+    NSTimeInterval delay = self.startupWatchdogDeferrals == 0 ? 12.0 : 4.0;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (self == nil) {
+            return;
+        }
         if (self.loadingOverlayHidden ||
             self.startupFailureOverlayVisible ||
             self.startupGeneration != generation) {
+            self.webSocketWatchdogScheduled = NO;
+            return;
+        }
+        if (self.pageLoadedSignalReceived &&
+            self.pageContentReadySignalReceived) {
+            self.startupWatchdogDeferrals += 1;
+            self.webSocketWatchdogScheduled = NO;
+            [self logEvent:@"warning"
+                     source:@"startup_watchdog"
+                     detail:[NSString stringWithFormat:
+                                         @"deferring failure because page content is healthy; webSocketOpen=%@ healthyProbes=%lu deferrals=%lu",
+                                         self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+                                         (unsigned long)self.healthyWithoutWebSocketProbeCount,
+                                         (unsigned long)self.startupWatchdogDeferrals]];
+            [self updateLoadingMessage:
+                @"界面内容已确认可见，正在完成兼容启动..."];
+            [self updateDiagnosticBarStatus:
+                [NSString stringWithFormat:
+                    @"CFData %@ | 页面已确认可见 | 兼容启动",
+                    kDiagnosticVersion]];
+            [self hideLoadingOverlay];
+            return;
+        }
+        if (self.startupWatchdogDeferrals < 2) {
+            self.startupWatchdogDeferrals += 1;
+            self.webSocketWatchdogScheduled = NO;
+            [self logEvent:@"warning"
+                     source:@"startup_watchdog"
+                     detail:[NSString stringWithFormat:
+                                         @"deferring startup failure attempt=%lu pageLoaded=%@ webSocketOpen=%@ contentReady=%@",
+                                         (unsigned long)self.startupWatchdogDeferrals,
+                                         self.pageLoadedSignalReceived ? @"YES" : @"NO",
+                                         self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+                                         self.pageContentReadySignalReceived ? @"YES" : @"NO"]];
+            [self updateLoadingMessage:
+                @"页面正在完成渲染，继续等待本地连接确认..."];
+            [self evaluateWebSocketState:@"startup_watchdog"];
+            [self scheduleStartupWatchdogForGeneration:generation];
             return;
         }
         NSString *state = self.pageLoadedSignalReceived
             ? [NSString stringWithFormat:
-                  @"pageLoaded=YES webSocketOpen=%@ contentReady=%@",
-                  self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
-                  self.pageContentReadySignalReceived ? @"YES" : @"NO"]
+                   @"pageLoaded=YES webSocketOpen=%@ contentReady=%@ wsReadyState=%@",
+                   self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+                   self.pageContentReadySignalReceived ? @"YES" : @"NO",
+                   self.lastWebSocketReadyState ?: @"missing"]
             : [NSString stringWithFormat:
-                  @"pageLoaded=NO webSocketOpen=%@ contentReady=%@",
-                  self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
-                  self.pageContentReadySignalReceived ? @"YES" : @"NO"];
+                   @"pageLoaded=NO webSocketOpen=%@ contentReady=%@",
+                   self.webSocketOpenedSignalReceived ? @"YES" : @"NO",
+                   self.pageContentReadySignalReceived ? @"YES" : @"NO"];
         [self logEvent:@"error" source:@"startup_watchdog"
-                detail:[NSString stringWithFormat:@"startup stuck for 15s; %@", state]];
+                detail:[NSString stringWithFormat:
+                                    @"startup still incomplete after %@; %@",
+                                    delay >= 12 ? @"12s" : @"watchdog deferrals", state]];
         [self showStartupError:@"界面未完成连接"
                        message:@"页面加载超时，请点击“复制诊断日志”并把内容发给我；之后可以点击重试。"];
     });
@@ -1477,6 +1556,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                                    self.webSocketOpenedSignalReceived
                                        ? @"WebSocket 已确认"
                                        : @"WebSocket 兼容启动"]];
+    [self injectExportBridge];
     [UIView animateWithDuration:0.18 animations:^{
         self.loadingOverlay.alpha = 0;
     } completion:^(BOOL finished) {
@@ -1695,104 +1775,43 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
 - (NSString *)webViewContentHealthScript {
     return @"(function(){try{"
-            "function rectOf(el){if(!el||!el.getBoundingClientRect){return null;}"
-            "var r=el.getBoundingClientRect();"
-            "return {left:Math.round(r.left),top:Math.round(r.top),"
-            "width:Math.round(r.width),height:Math.round(r.height),"
-            "right:Math.round(r.right),bottom:Math.round(r.bottom)};}"
             "function safeText(value){try{return String(value||'');}"
             "catch(e){return '';}}"
-            "function safeSlice(value,max){try{"
-            "var chars=Array.from(String(value||''));"
-            "return chars.slice(0,max).join('');}"
-            "catch(e){return safeText(value).slice(0,max);}}"
-            "function textOf(el){return safeText(el?el.innerText||el.textContent:'');}"
-            "function styleOf(el){if(!el||!window.getComputedStyle){return null;}"
+            "function styleSummary(el){if(!el||!window.getComputedStyle){return null;}"
             "var s=window.getComputedStyle(el);"
-            "return {backgroundColor:s.backgroundColor||'',color:s.color||'',"
-            "backgroundImage:safeSlice(s.backgroundImage,220),"
-            "opacity:s.opacity||'1',display:s.display||'',"
-            "visibility:s.visibility||'',position:s.position||'',"
-            "transform:safeSlice(s.transform,100),"
-            "zIndex:s.zIndex||'',overflow:s.overflow||'',"
-            "pointerEvents:s.pointerEvents||''};}"
+            "return {display:s.display||'',visibility:s.visibility||'',"
+            "opacity:s.opacity||'1'};}"
             "var body=document.body||null;"
-            "var html=document.documentElement||null;"
             "var container=null;try{container=document.querySelector('.container');}catch(e){}"
-            "var elements=[];try{if(body){elements=body.querySelectorAll('*');}}catch(e){}"
-            "var visibleElementCount=0,visibleTextLength=0;"
-            "var viewportVisibleElementCount=0,viewportTextLength=0;"
-            "function intersectsViewport(rect){return rect&&rect.width>0&&rect.height>0"
-            "&&rect.right>0&&rect.bottom>0&&rect.left<window.innerWidth"
-            "&&rect.top<window.innerHeight;}"
-            "for(var i=0;i<elements.length&&i<800;i++){try{"
-            "var el=elements[i];"
-            "var style=window.getComputedStyle(el);"
-            "var rect=rectOf(el);"
-            "if(style.display!=='none'&&style.visibility!=='hidden'&&"
-            "parseFloat(style.opacity||'1')>0&&rect&&rect.width>0&&rect.height>0){"
-            "visibleElementCount++;"
-            "var text=safeText(el.innerText||el.textContent||'').replace(/\\s+/g,'');"
-            "visibleTextLength+=text.length;"
-            "if(intersectsViewport(rect)){viewportVisibleElementCount++;"
-            "viewportTextLength+=text.length;}"
-            "}}catch(e){}}"
-            "var htmlStyle=styleOf(html),bodyStyle=styleOf(body);"
-            "var containerStyle=styleOf(container);"
-            "var keyRects={};"
-            "var keySelectors=['h1','#status','#btnStart','#btnOfficial','#btnNSB',"
-            "'.container','#officialControls','#nsbControls'];"
-            "for(var j=0;j<keySelectors.length;j++){try{"
-            "var keyEl=document.querySelector(keySelectors[j]);"
-            "keyRects[keySelectors[j]]=keyEl"
-            "?{rect:rectOf(keyEl),style:styleOf(keyEl),text:safeSlice(textOf(keyEl),100)}"
-            ":null;}catch(e){}}"
-            "var cx=Math.max(1,window.innerWidth*0.5);"
-            "var points=[[cx,window.innerHeight*0.22],[cx,window.innerHeight*0.45],"
-            "[window.innerWidth*0.25,window.innerHeight*0.55],"
-            "[window.innerWidth*0.75,window.innerHeight*0.55]];"
-            "var viewportHits=[];"
-            "for(var p=0;p<points.length;p++){try{"
-            "var hitEl=document.elementFromPoint(Math.round(points[p][0]),"
-            "Math.round(points[p][1]));"
-            "if(hitEl){viewportHits.push({tag:hitEl.tagName||'',"
-            "id:hitEl.id||'',"
-            "className:safeSlice(hitEl.className,140),"
-            "text:safeSlice(textOf(hitEl),100),rect:rectOf(hitEl),"
-            "style:styleOf(hitEl)});}}catch(e){}}"
-            "var visualViewport=null;"
-            "try{if(window.visualViewport){visualViewport={"
-            "width:window.visualViewport.width,height:window.visualViewport.height,"
-            "scale:window.visualViewport.scale,"
-            "offsetTop:window.visualViewport.offsetTop,"
-            "offsetLeft:window.visualViewport.offsetLeft,"
-            "pageTop:window.visualViewport.pageTop,"
-            "pageLeft:window.visualViewport.pageLeft};}}catch(e){}"
+            "var bodyRect=null;try{if(body){var r=body.getBoundingClientRect();"
+            "bodyRect={width:r.width,height:r.height};}}catch(e){}"
+            "var bodyText='';var bodyTextLength=0;"
+            "try{if(body){bodyText=safeText(body.textContent).replace(/\\s+/g,'');"
+            "bodyTextLength=bodyText.length;}}catch(e){}"
+            "var statusText='';try{var statusEl=document.getElementById('status');"
+            "statusText=safeText(statusEl?statusEl.textContent:'').slice(0,80);}catch(e){}"
+            "var interactiveCount=0;try{if(body){"
+            "interactiveCount=body.querySelectorAll('button,input,select,textarea,a').length;"
+            "}}catch(e){}"
             "var wsState=window.__cfdataIOSWebSocketState||'none';"
             "var wsReadyState='missing';"
             "try{if(typeof window.__cfdataIOSWebSocketReadyState==='number'){"
             "wsReadyState=String(window.__cfdataIOSWebSocketReadyState);}}catch(e){}"
-            "try{if(typeof ws!=='undefined'&&ws&&typeof ws.readyState==='number'){"
-            "wsReadyState=String(ws.readyState);}}catch(e){}"
+            "try{var socket=window.__cfdataIOSWebSocket||"
+            "(typeof ws!=='undefined'?ws:null);"
+            "if(socket&&typeof socket.readyState==='number'){"
+            "wsReadyState=String(socket.readyState);}}catch(e){}"
             "return JSON.stringify({"
             "readyState:document.readyState,title:document.title,url:location.href,"
             "bodyChildren:body?body.children.length:-1,"
-            "bodyText:body?safeSlice(textOf(body),600):'',"
-            "bodyTextLength:body?textOf(body).length:-1,"
-            "bodyHTML:body?safeSlice(body.innerHTML,600):'',"
-            "bodyWidth:body?body.getBoundingClientRect().width:-1,"
-            "bodyHeight:body?body.getBoundingClientRect().height:-1,"
+            "bodyText:body?safeText(body.textContent).slice(0,180):'',"
+            "bodyTextLength:bodyTextLength,"
+            "bodyWidth:bodyRect?bodyRect.width:-1,"
+            "bodyHeight:bodyRect?bodyRect.height:-1,"
             "scrollHeight:document.documentElement.scrollHeight,"
-            "scrollY:window.scrollY||0,"
-            "documentScrollTop:document.documentElement.scrollTop||0,"
             "innerWidth:window.innerWidth,innerHeight:window.innerHeight,"
-            "visualViewport:visualViewport,htmlStyle:htmlStyle,"
-            "bodyStyle:bodyStyle,containerStyle:containerStyle,"
-            "keyRects:keyRects,viewportHits:viewportHits,"
-            "visibleElementCount:visibleElementCount,"
-            "visibleTextLength:visibleTextLength,"
-            "viewportVisibleElementCount:viewportVisibleElementCount,"
-            "viewportTextLength:viewportTextLength,"
+            "bodyStyle:styleSummary(body),containerStyle:styleSummary(container),"
+            "interactiveCount:interactiveCount,statusText:statusText,"
             "webSocketState:wsState,webSocketReadyState:wsReadyState,"
             "pageBootError:window.__cfdataIOSPageBootError||'',"
             "installed:!!window.__cfdataIOSDiagnosticsInstalled,"
@@ -1802,6 +1821,124 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
             "return JSON.stringify({probeError:String(error&&error.message?"
             "error.message:error)});"
             "}})()";
+}
+
+- (NSString *)webSocketStateScript {
+    return @"(function(){try{"
+            "var socket=window.__cfdataIOSWebSocket||"
+            "(typeof ws!=='undefined'?ws:null);"
+            "var ready=-1,state='missing',url='';"
+            "try{if(socket){"
+            "ready=Number(socket.readyState);"
+            "state=String(window.__cfdataIOSWebSocketState||'');"
+            "url=String(socket.url||'');}}catch(e){}"
+            "if(ready<0&&typeof window.__cfdataIOSWebSocketReadyState==='number'){"
+            "ready=Number(window.__cfdataIOSWebSocketReadyState);}"
+            "return JSON.stringify({readyState:ready,state:state,url:url});"
+            "}catch(error){return JSON.stringify({probeError:String("
+            "error&&error.message?error.message:error)});}})()";
+}
+
+- (void)evaluateWebSocketState:(NSString *)reason {
+    if (self.webSocketStateProbeInFlight) {
+        [self logEvent:@"info"
+                 source:@"websocket_state"
+                 detail:[NSString stringWithFormat:
+                                      @"state probe skipped because previous probe is still in flight reason=%@",
+                                      reason ?: @"unknown"]];
+        return;
+    }
+    NSUInteger runtimeGeneration = self.webViewRuntimeGeneration;
+    self.webSocketStateProbeRequestID += 1;
+    NSUInteger requestID = self.webSocketStateProbeRequestID;
+    self.webSocketStateProbeInFlight = YES;
+    __weak typeof(self) weakSelf = self;
+    [self.webView evaluateJavaScript:[self webSocketStateScript]
+                   completionHandler:^(id result, NSError *error) {
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self == nil) {
+                           return;
+                       }
+                       if (runtimeGeneration == self.webViewRuntimeGeneration &&
+                           requestID == self.webSocketStateProbeRequestID) {
+                           self.webSocketStateProbeInFlight = NO;
+                       }
+                       if (runtimeGeneration != self.webViewRuntimeGeneration ||
+                           requestID != self.webSocketStateProbeRequestID) {
+                           return;
+                       }
+
+                       NSString *raw = [result isKindOfClass:[NSString class]]
+                           ? (NSString *)result
+                           : @"none";
+                       NSDictionary *state = nil;
+                       if ([result isKindOfClass:[NSString class]]) {
+                           NSData *jsonData = [(NSString *)result
+                               dataUsingEncoding:NSUTF8StringEncoding];
+                           if (jsonData != nil) {
+                               id object = [NSJSONSerialization JSONObjectWithData:jsonData
+                                                                           options:0
+                                                                             error:nil];
+                               if ([object isKindOfClass:[NSDictionary class]]) {
+                                   state = (NSDictionary *)object;
+                               }
+                           }
+                       }
+                       self.webSocketStateProbeCount += 1;
+
+                       id readyValue = state[@"readyState"];
+                       NSString *readyState = nil;
+                       if ([readyValue isKindOfClass:[NSNumber class]]) {
+                           readyState = [(NSNumber *)readyValue stringValue];
+                       } else if ([readyValue isKindOfClass:[NSString class]]) {
+                           readyState = (NSString *)readyValue;
+                       }
+                       NSString *webSocketState = state[@"state"];
+                       self.lastWebSocketReadyState = readyState ?: @"missing";
+                       [self logEvent:error == nil ? @"info" : @"warning"
+                                source:@"websocket_state"
+                                detail:[NSString stringWithFormat:
+                                                    @"reason=%@ readyState=%@ state=%@ url=%@ raw=%@ error=%@",
+                                                    reason ?: @"unknown",
+                                                    self.lastWebSocketReadyState ?: @"missing",
+                                                    webSocketState ?: @"missing",
+                                                    state[@"url"] ?: @"none",
+                                                    raw.length > 220 ? [raw substringToIndex:220] : raw,
+                                                    error.localizedDescription ?: @"none"]];
+
+                       BOOL socketIsOpen =
+                           [readyState isEqualToString:@"1"] ||
+                           [webSocketState isEqualToString:@"open"];
+                       if (socketIsOpen &&
+                           !self.webSocketOpenedSignalReceived) {
+                           self.webSocketOpenedSignalReceived = YES;
+                           [self logEvent:@"info"
+                                    source:@"websocket_fallback"
+                                    detail:@"native WebSocket state probe observed OPEN"];
+                           [self updateLoadingMessage:
+                               @"WebSocket 已就绪，正在确认界面内容..."];
+                           [self updateDiagnosticBarStatus:
+                               [NSString stringWithFormat:
+                                   @"CFData %@ | WebSocket 已就绪",
+                                   kDiagnosticVersion]];
+                           [self evaluateWebViewContentHealth:@"websocket_state_open"
+                                     allowHideWithoutWebSocket:NO];
+                       }
+                   }];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self != nil &&
+                           self.webViewRuntimeGeneration == runtimeGeneration &&
+                           requestID == self.webSocketStateProbeRequestID &&
+                           self.webSocketStateProbeInFlight) {
+                           self.webSocketStateProbeInFlight = NO;
+                           [self logEvent:@"warning"
+                                    source:@"websocket_state"
+                                    detail:@"state probe completion timed out; clearing in-flight flag"];
+                       }
+                   });
 }
 
 - (NSInteger)integerInState:(NSDictionary *)state
@@ -1824,85 +1961,26 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     NSString *display = style[@"display"] ?: @"block";
     NSString *visibility = style[@"visibility"] ?: @"visible";
     NSString *opacityText = style[@"opacity"] ?: @"1";
-    NSString *backgroundColor = style[@"backgroundColor"] ?: @"";
-    NSString *backgroundImage = style[@"backgroundImage"] ?: @"";
-    NSString *textColor = style[@"color"] ?: @"";
     double opacity = [opacityText doubleValue];
     BOOL hidden =
         [display isEqualToString:@"none"] ||
         [visibility isEqualToString:@"hidden"] ||
         [visibility isEqualToString:@"collapse"];
-    BOOL transparentColor =
-        backgroundColor.length == 0 ||
-        [backgroundColor isEqualToString:@"transparent"] ||
-        [backgroundColor containsString:@"rgba(0, 0, 0, 0)"] ||
-        [backgroundColor containsString:@"rgba(0,0,0,0)"];
-    BOOL hasBackground =
-        (!transparentColor) ||
-        (backgroundImage.length > 0 && ![backgroundImage isEqualToString:@"none"]);
-    BOOL hasTextColor =
-        textColor.length > 0 &&
-        ![textColor isEqualToString:@"transparent"] &&
-        ![textColor containsString:@"rgba(0, 0, 0, 0)"];
-    return !hidden && opacity > 0.01 && hasBackground && hasTextColor;
-}
-
-- (BOOL)viewportHitsContainMeaningfulElement:(NSArray *)hits {
-    if (![hits isKindOfClass:[NSArray class]]) {
-        return NO;
-    }
-    NSSet<NSString *> *interactiveTags =
-        [NSSet setWithArray:@[@"A", @"BUTTON", @"INPUT", @"SELECT", @"TEXTAREA",
-                              @"LABEL", @"H1", @"H2", @"H3", @"OPTION", @"SPAN"]];
-    for (NSDictionary *hit in hits) {
-        if (![hit isKindOfClass:[NSDictionary class]]) {
-            continue;
-        }
-        NSString *tag = [hit[@"tag"] uppercaseString] ?: @"";
-        NSString *text = hit[@"text"] ?: @"";
-        NSDictionary *rect = hit[@"rect"];
-        if (![rect isKindOfClass:[NSDictionary class]]) {
-            continue;
-        }
-        double width = [rect[@"width"] doubleValue];
-        double height = [rect[@"height"] doubleValue];
-        NSString *className = hit[@"className"];
-        BOOL htmlRoot =
-            [tag isEqualToString:@"HTML"] ||
-            [tag isEqualToString:@"BODY"] ||
-            ([tag isEqualToString:@"DIV"] &&
-             [className isKindOfClass:[NSString class]] &&
-             [className containsString:@"container"]);
-        if (htmlRoot || width <= 0 || height <= 0) {
-            continue;
-        }
-        if (text.length > 0 || [interactiveTags containsObject:tag]) {
-            return YES;
-        }
-    }
-    return NO;
+    return !hidden && opacity > 0.01;
 }
 
 - (BOOL)webViewStateIndicatesHealthyContent:(NSDictionary *)state {
     NSString *readyState = state[@"readyState"];
     NSString *bodyText = state[@"bodyText"];
-    NSString *bodyHTML = state[@"bodyHTML"];
     NSInteger bodyChildren = [self integerInState:state
                                              key:@"bodyChildren"
                                          fallback:-1];
     NSInteger bodyTextLength = [self integerInState:state
                                                 key:@"bodyTextLength"
                                             fallback:-1];
-    NSInteger visibleElementCount = [self integerInState:state
-                                                     key:@"visibleElementCount"
-                                                 fallback:-1];
-    NSInteger visibleTextLength = [self integerInState:state
-                                                   key:@"visibleTextLength"
-                                               fallback:-1];
-    NSInteger viewportVisibleElementCount =
-        [self integerInState:state key:@"viewportVisibleElementCount" fallback:-1];
-    NSInteger viewportTextLength =
-        [self integerInState:state key:@"viewportTextLength" fallback:-1];
+    NSInteger interactiveCount = [self integerInState:state
+                                                  key:@"interactiveCount"
+                                              fallback:-1];
     double bodyWidth = [self integerInState:state key:@"bodyWidth" fallback:-1];
     double bodyHeight = [self integerInState:state key:@"bodyHeight" fallback:-1];
     double innerWidth = [self integerInState:state key:@"innerWidth" fallback:-1];
@@ -1915,14 +1993,8 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         bodyChildren > 0 &&
         bodyTextLength >= 8 &&
         [bodyText isKindOfClass:[NSString class]] &&
-        bodyText.length > 0 &&
-        [bodyHTML isKindOfClass:[NSString class]] &&
-        bodyHTML.length > 0;
-    BOOL hasViewportContent =
-        visibleElementCount >= 3 &&
-        visibleTextLength >= 8 &&
-        viewportVisibleElementCount >= 2 &&
-        viewportTextLength >= 8;
+        bodyText.length > 0;
+    BOOL hasInteractiveSurface = interactiveCount >= 1;
     BOOL hasUsableDimensions =
         bodyWidth > 1 && bodyHeight > 1 &&
         innerWidth > 1 && innerHeight > 1;
@@ -1930,28 +2002,14 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         [self visualStyleAllowsPainting:state[@"bodyStyle"]];
     BOOL containerPaints =
         [self visualStyleAllowsPainting:state[@"containerStyle"]];
-    BOOL viewportHitIsMeaningful =
-        [self viewportHitsContainMeaningfulElement:state[@"viewportHits"]];
-    NSDictionary *visualViewport = state[@"visualViewport"];
-    BOOL viewportScaleIsUsable = YES;
-    if ([visualViewport isKindOfClass:[NSDictionary class]]) {
-        id scaleValue = visualViewport[@"scale"];
-        if ([scaleValue isKindOfClass:[NSNumber class]] ||
-            [scaleValue isKindOfClass:[NSString class]]) {
-            double scale = [scaleValue doubleValue];
-            viewportScaleIsUsable = scale >= 0.5 && scale <= 2;
-        }
-    }
-    return pageIsLoaded && hasBodyContent && hasViewportContent &&
-           hasUsableDimensions && bodyPaints && containerPaints &&
-           viewportHitIsMeaningful && viewportScaleIsUsable;
+    return pageIsLoaded && hasBodyContent && hasInteractiveSurface &&
+           hasUsableDimensions && bodyPaints && containerPaints;
 }
 
 - (void)processWebViewContentHealthResult:(id)result
                                     error:(NSError *)error
                                    reason:(NSString *)reason
                  allowHideWithoutWebSocket:(BOOL)allowHideWithoutWebSocket {
-    (void)allowHideWithoutWebSocket;
     NSString *raw = [result isKindOfClass:[NSString class]]
         ? (NSString *)result
         : @"none";
@@ -1987,9 +2045,6 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
     NSDictionary *bodyStyle = state[@"bodyStyle"];
     NSDictionary *containerStyle = state[@"containerStyle"];
-    NSArray *viewportHits = state[@"viewportHits"];
-    NSUInteger viewportHitCount =
-        [viewportHits isKindOfClass:[NSArray class]] ? viewportHits.count : 0;
     NSString *bodyStyleSummary =
         [bodyStyle isKindOfClass:[NSDictionary class]]
             ? [bodyStyle description]
@@ -2002,30 +2057,27 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
              source:@"content_health_summary"
              detail:[NSString stringWithFormat:
                                   @"reason=%@ readyState=%@ bodyChildren=%@"
-                                  " bodyText=%@ viewportElements=%@ viewportText=%@"
-                                  " inner=%@ scrollY=%@ scrollHeight=%@"
-                                  " bodyStyle=%@ containerStyle=%@ hits=%lu vv=%@"
-                                  " error=%@",
+                                  " bodyText=%@ interactive=%@ status=%@ inner=%@"
+                                  " scrollHeight=%@ bodyStyle=%@ containerStyle=%@"
+                                  " wsReadyState=%@ error=%@",
                                   reason ?: @"unknown",
                                   state[@"readyState"] ?: @"none",
                                   state[@"bodyChildren"] ?: @"none",
                                   state[@"bodyTextLength"] ?: @"none",
-                                  state[@"viewportVisibleElementCount"] ?: @"none",
-                                  state[@"viewportTextLength"] ?: @"none",
+                                  state[@"interactiveCount"] ?: @"none",
+                                  state[@"statusText"] ?: @"none",
                                   [NSString stringWithFormat:@"%@x%@",
                                                              state[@"innerWidth"] ?: @"?",
                                                              state[@"innerHeight"] ?: @"?"],
-                                  state[@"scrollY"] ?: @"none",
                                   state[@"scrollHeight"] ?: @"none",
                                   bodyStyleSummary ?: @"none",
                                   containerStyleSummary ?: @"none",
-                                  (unsigned long)viewportHitCount,
-                                  state[@"visualViewport"] ?: @"none",
+                                  state[@"webSocketReadyState"] ?: @"none",
                                   error.localizedDescription ?: @"none"]];
 
     NSString *loggedRaw = raw;
-    if (loggedRaw.length > 6000) {
-        loggedRaw = [loggedRaw substringToIndex:6000];
+    if (loggedRaw.length > 1600) {
+        loggedRaw = [loggedRaw substringToIndex:1600];
     }
     [self logEvent:parsedOK ? @"info" : @"warning"
              source:@"content_health"
@@ -2057,7 +2109,11 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
             if ([readyState isEqualToString:@"complete"]) {
                 self.healthyWithoutWebSocketProbeCount += 1;
-                if (self.healthyWithoutWebSocketProbeCount >= 2) {
+                BOOL canHideWithoutWebSocket =
+                    self.healthyWithoutWebSocketProbeCount >= 2 ||
+                    self.startupWatchdogDeferrals >= 1 ||
+                    allowHideWithoutWebSocket;
+                if (canHideWithoutWebSocket) {
                     [self logEvent:@"warning"
                              source:@"content_health"
                              detail:@"healthy page verified twice without WebSocket signal; using compatible startup fallback"];
@@ -2124,6 +2180,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                            self.webSocketOpenedSignalReceived) {
                            return;
                        }
+                       [self evaluateWebSocketState:@"websocket_fallback_check"];
                        [self evaluateWebViewContentHealth:@"websocket_fallback_check"
                                  allowHideWithoutWebSocket:NO];
                    });
@@ -2134,10 +2191,10 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     NSString *summary = state[@"probeError"];
     if (summary.length == 0) {
         summary = [NSString stringWithFormat:
-            @"readyState=%@ bodyTextLength=%@ visibleElements=%@",
+            @"readyState=%@ bodyTextLength=%@ interactiveElements=%@",
             state[@"readyState"] ?: @"missing",
             state[@"bodyTextLength"] ?: @"missing",
-            state[@"visibleElementCount"] ?: @"missing"];
+            state[@"interactiveCount"] ?: @"missing"];
     }
     [self logEvent:@"error"
              source:@"content_health"
@@ -2173,6 +2230,18 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
 - (void)evaluateWebViewContentHealth:(NSString *)reason
             allowHideWithoutWebSocket:(BOOL)allowHideWithoutWebSocket {
+    NSUInteger runtimeGeneration = self.webViewRuntimeGeneration;
+    if (self.webViewProbeInFlight) {
+        [self logEvent:@"info"
+                 source:@"content_health"
+                 detail:[NSString stringWithFormat:
+                                      @"probe skipped because previous probe is still in flight reason=%@",
+                                      reason ?: @"unknown"]];
+        return;
+    }
+    self.webViewProbeInFlight = YES;
+    self.webViewProbeRequestID += 1;
+    NSUInteger requestID = self.webViewProbeRequestID;
     __weak typeof(self) weakSelf = self;
     [self.webView evaluateJavaScript:[self webViewContentHealthScript]
                    completionHandler:^(id result, NSError *error) {
@@ -2180,11 +2249,33 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                        if (self == nil) {
                            return;
                        }
+                       if (runtimeGeneration == self.webViewRuntimeGeneration &&
+                           requestID == self.webViewProbeRequestID) {
+                           self.webViewProbeInFlight = NO;
+                       }
+                       if (runtimeGeneration != self.webViewRuntimeGeneration ||
+                           requestID != self.webViewProbeRequestID) {
+                           return;
+                       }
                        [self processWebViewContentHealthResult:result
                                                         error:error
                                                        reason:reason
                                      allowHideWithoutWebSocket:allowHideWithoutWebSocket];
                    }];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self != nil &&
+                           self.webViewRuntimeGeneration == runtimeGeneration &&
+                           requestID == self.webViewProbeRequestID &&
+                           self.webViewProbeInFlight) {
+                           self.webViewProbeInFlight = NO;
+                           [self logEvent:@"warning"
+                                    source:@"content_health"
+                                    detail:@"content probe completion timed out; clearing in-flight flag"];
+                       }
+                   });
 }
 
 - (void)schedulePostHideContentHealthChecks {
@@ -2245,6 +2336,9 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 
 - (void)webView:(WKWebView *)webView
     didStartProvisionalNavigation:(WKNavigation *)navigation {
+    self.webViewRuntimeGeneration += 1;
+    self.webViewProbeInFlight = NO;
+    self.webViewProbeCount = 0;
     [self logEvent:@"info" source:@"webview"
             detail:[NSString stringWithFormat:@"didStartProvisionalNavigation url=%@",
                                               webView.URL.absoluteString ?: @"none"]];
@@ -2258,10 +2352,11 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
 }
 
 - (void)scheduleWebViewRuntimeProbes {
-    if (self.loadingOverlayHidden) {
+    if (self.loadingOverlayHidden || self.startupFailureOverlayVisible) {
         return;
     }
 
+    NSUInteger runtimeGeneration = self.webViewRuntimeGeneration;
     NSUInteger probeNumber = 0;
     @synchronized(self) {
         self.webViewProbeCount += 1;
@@ -2274,22 +2369,14 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     __weak typeof(self) weakSelf = self;
     NSString *reason = [NSString stringWithFormat:@"runtime_tick_%lu",
                                                   (unsigned long)probeNumber];
-    [self.webView evaluateJavaScript:[self webViewContentHealthScript]
-                   completionHandler:^(id result, NSError *error) {
-                       __strong typeof(weakSelf) self = weakSelf;
-                       if (self == nil || self.loadingOverlayHidden) {
-                           return;
-                       }
-                       [self processWebViewContentHealthResult:result
-                                                        error:error
-                                                       reason:reason
-                                     allowHideWithoutWebSocket:NO];
-                   }];
+    [self evaluateWebViewContentHealth:reason
+             allowHideWithoutWebSocket:NO];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
                        __strong typeof(weakSelf) self = weakSelf;
-                       if (self != nil) {
+                       if (self != nil &&
+                           self.webViewRuntimeGeneration == runtimeGeneration) {
                            [self scheduleWebViewRuntimeProbes];
                        }
                    });
@@ -2300,32 +2387,22 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
     [self logEvent:@"info" source:@"webview"
             detail:[NSString stringWithFormat:@"didFinishNavigation url=%@",
                                               webView.URL.absoluteString ?: @"none"]];
-    NSString *stateScript = @"JSON.stringify({readyState:document.readyState,"
-                             "title:document.title,url:location.href,"
-                             "hasBody:!!document.body,"
-                             "bodyText:document.body?document.body.innerText.slice(0,120):''})";
-    [self.webView evaluateJavaScript:stateScript
-                   completionHandler:^(id result, NSError *error) {
-                       [self logEvent:(error == nil ? @"info" : @"warning")
-                               source:@"webview"
-                               detail:[NSString stringWithFormat:@"pageState=%@ error=%@",
-                                                                 result ?: @"none",
-                                                                 error.localizedDescription ?: @"none"]];
-                   }];
-    [self injectExportBridge];
-    [self.webView evaluateJavaScript:@"!!window.__cfdataIOSDiagnosticsInstalled"
-                   completionHandler:^(id result, NSError *error) {
-                       [self logEvent:error == nil ? @"info" : @"warning"
-                               source:@"webview"
-                               detail:[NSString stringWithFormat:
-                                                 @"runtimeDiagnosticInstalled=%@ error=%@",
-                                                 result ?: @"none",
-                                                 error.localizedDescription ?: @"none"]];
-                   }];
     [self updateLoadingMessage:@"页面载入完成，正在检查界面内容..."];
     self.pageLoadedSignalReceived = YES;
-    [self evaluateWebViewContentHealth:@"did_finish"
-             allowHideWithoutWebSocket:NO];
+    NSUInteger runtimeGeneration = self.webViewRuntimeGeneration;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       __strong typeof(weakSelf) self = weakSelf;
+                       if (self != nil &&
+                           self.webViewRuntimeGeneration == runtimeGeneration &&
+                           !self.loadingOverlayHidden &&
+                           !self.startupFailureOverlayVisible) {
+                           [self evaluateWebSocketState:@"did_finish"];
+                           [self evaluateWebViewContentHealth:@"did_finish"
+                                    allowHideWithoutWebSocket:NO];
+                       }
+                   });
 }
 
 - (void)webView:(WKWebView *)webView
@@ -2384,6 +2461,7 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
                 [self updateDiagnosticBarStatus:
                     [NSString stringWithFormat:@"CFData %@ | WebSocket 创建中",
                                                kDiagnosticVersion]];
+                [self evaluateWebSocketState:@"websocket_create_signal"];
             } else if ([detail hasPrefix:@"close"] && self.loadingDiagnosticLabel != nil) {
                 self.loadingDiagnosticLabel.text =
                     [NSString stringWithFormat:@"版本 %@ | WebSocket 已关闭 | %@",
@@ -2403,8 +2481,36 @@ static void CFDataAppendStringToPath(NSString *content, NSString *path) {
         }
 
         if ([kind isEqualToString:@"content_state"]) {
-            [self evaluateWebViewContentHealth:@"page_content_state"
-                     allowHideWithoutWebSocket:NO];
+            if ([detail isEqualToString:@"ready"]) {
+                self.pageLoadedSignalReceived = YES;
+                self.pageContentReadySignalReceived = YES;
+                self.emptyContentProbeCount = 0;
+                [self logEvent:@"info"
+                         source:@"content_signal"
+                         detail:@"synchronous content_state=ready accepted; WebKit probe is no longer required to reveal the page"];
+                [self updateLoadingMessage:@"页面内容已确认，正在完成启动..."];
+                [self updateDiagnosticBarStatus:
+                    [NSString stringWithFormat:
+                        @"CFData %@ | 页面内容已确认 | 正在显示界面",
+                        kDiagnosticVersion]];
+                [self evaluateWebSocketState:@"page_content_state"];
+
+                NSUInteger runtimeGeneration = self.webViewRuntimeGeneration;
+                __weak typeof(self) weakSelf = self;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                                   __strong typeof(weakSelf) self = weakSelf;
+                                   if (self != nil &&
+                                       self.webViewRuntimeGeneration == runtimeGeneration &&
+                                       !self.loadingOverlayHidden &&
+                                       !self.startupFailureOverlayVisible) {
+                                       [self hideLoadingOverlay];
+                                   }
+                               });
+            } else {
+                [self evaluateWebViewContentHealth:@"page_content_state"
+                         allowHideWithoutWebSocket:NO];
+            }
             return;
         }
 

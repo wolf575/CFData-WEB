@@ -2500,10 +2500,16 @@
                         .replace(/\s+/g, '').length;
                     visibleElementCount = body.children.length;
                 }
+                const hasStrongDom =
+                    body &&
+                    visibleElementCount > 0 &&
+                    String(body.innerText || '')
+                        .replace(/\s+/g, '').length >= 80;
                 const documentReady =
                     document.readyState === 'interactive' ||
                     document.readyState === 'complete';
-                if (documentReady && visibleElementCount > 0 &&
+                if ((documentReady || hasStrongDom) &&
+                    visibleElementCount > 0 &&
                     visibleTextLength >= 8) {
                     state = 'ready';
                 }
@@ -3217,6 +3223,9 @@
                 wsURL + ' generation=' + generation);
             const socket = new WebSocket(wsURL);
             ws = socket;
+            try {
+                window.__cfdataIOSWebSocket = socket;
+            } catch (_) {}
             reportIOSWebSocket('create',
                 wsURL + ' readyState=' + socket.readyState +
                 ' generation=' + generation);
@@ -6731,7 +6740,7 @@
             runIOSBootStep('switchMode', () => switchMode('official'));
             runIOSBootStep('initTheme', initThemeFromStorage);
             reportIOSBootStage('boot_sequence_done');
-            window.setTimeout(reportIOSContentState, 0);
+            reportIOSContentState();
             window.setTimeout(finalizeIOSRender, 300);
         });
 
